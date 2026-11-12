@@ -139,6 +139,8 @@ struct Starting {
 /// How long a capture gets to send its first image. A window that stays minimized
 /// sends nothing on most compositors: better to say so than to wait in silence.
 const FIRST_FRAME: Duration = Duration::from_secs(15);
+/// Pause before opening again a viewer's connection that fell mid-stream.
+const REOPEN_AFTER: Duration = Duration::from_secs(3);
 
 struct Live {
     audio: Option<crate::audio::Audio>,
@@ -288,6 +290,9 @@ struct Session {
     starting: Option<Starting>,
     /// Tells a late answer from a capture already given up on.
     attempt: u64,
+    /// When to open again the video or sound of a viewer whose connection fell
+    /// during the stream (see `on_conn_closed`).
+    reopen_at: Option<Instant>,
 }
 
 pub async fn run(mut cmds: mpsc::Receiver<Command>, ui: mpsc::Sender<Event>) {
@@ -387,6 +392,7 @@ async fn start(ui: &mpsc::Sender<Event>, name: String, server: Option<String>, c
         opening: None,
         starting: None,
         attempt: 0,
+        reopen_at: None,
     };
     s.spawn_signal_forwarder(sig_rx, peer_rx);
 
@@ -854,8 +860,34 @@ impl Session {
                 self.members.retain(|m| m.id != c.peer);
                 self.broadcast_roster().await;
             }
+            // A viewer's video or sound fell while the stream goes on: nothing else
+            // would open it again until someone joins or leaves, so the picture
+            // could go on without sound for good. Opened again after a pause, so a
+            // viewer who is leaving is gone from the roster by then, and a network
+            // that keeps failing gets one try per pause instead of a loop.
+            Kind::Turbo | Kind::Media if self.live.is_some() && self.members.iter().any(|m| m.id == c.peer) => {
+                let what = match (c.kind, c.audio_only) {
+                    (Kind::Turbo, _) => "video",
+                    (_, true) => "sound",
+                    _ => "video and sound",
+                };
+                tracing::warn!(who = %self.member_name(&c.peer), what, "a viewer's connection fell; opening it again");
+                // The page drops the sound it has when new video arrives, expecting
+                // new sound right after (app.js, acceptTurbo): both are opened again.
+                if c.kind == Kind::Turbo {
+                    let sound: Vec<String> = self.conns.iter().filter(|(_, s)| s.peer == c.peer && s.audio_only).map(|(k, _)| k.clone()).collect();
+                    for id in sound {
+                        self.close_conn(&id).await;
+                    }
+                }
+                self.reopen_at.get_or_insert_with(|| Instant::now() + REOPEN_AFTER);
+            }
             Kind::Turbo | Kind::Media => {}
         }
+    }
+
+    fn member_name(&self, id: &str) -> String {
+        self.members.iter().find(|m| m.id == id).map_or_else(|| id.to_owned(), |m| m.name.clone())
     }
 
     async fn on_message(&mut self, conn: String, v: Value) -> Result<(), ()> {
@@ -1440,6 +1472,12 @@ impl Session {
     }
 
     async fn on_tick(&mut self) {
+        if self.reopen_at.is_some_and(|t| Instant::now() >= t) {
+            self.reopen_at = None;
+            if self.live.is_some() {
+                self.sync_viewers().await;
+            }
+        }
         if self.starting.as_ref().is_some_and(|s| s.since.elapsed() >= FIRST_FRAME) {
             if let Some(starting) = self.starting.take() {
                 starting.control.stop.store(true, Ordering::Relaxed);
