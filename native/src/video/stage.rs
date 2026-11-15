@@ -12,7 +12,7 @@
 //! inline, as before, unless overlapping proves worth it (see [`Overlap`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -40,6 +40,10 @@ struct Shared {
     encoder: Mutex<Option<Encoder>>,
     /// What turns packets into frames (locked after `encoder`).
     out: Mutex<Output>,
+    /// Average encode time (ms) as `f32` bits, for [`Overlap`]. Outside `out`:
+    /// the capture thread reads it on every frame and must not wait for the
+    /// frame being encoded.
+    encode_ms: AtomicU32,
     stop: AtomicBool,
     failed: Mutex<Option<ffi::Error>>,
 }
@@ -50,8 +54,6 @@ struct Output {
     /// pts -> (capture time, size), for packets that come out after their frame.
     pending: HashMap<i64, (Instant, (u32, u32))>,
     index: u64,
-    /// Average encode time (ms), for [`Overlap`].
-    encode_ms: f32,
 }
 
 pub struct EncodeStage {
@@ -65,7 +67,8 @@ impl EncodeStage {
             slot: Mutex::new(None),
             ready: Condvar::new(),
             encoder: Mutex::new(None),
-            out: Mutex::new(Output { headers: h264::Headers::default(), hevc: h265::Headers::default(), pending: HashMap::new(), index: 0, encode_ms: 0.0 }),
+            out: Mutex::new(Output { headers: h264::Headers::default(), hevc: h265::Headers::default(), pending: HashMap::new(), index: 0 }),
+            encode_ms: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
         });
@@ -90,14 +93,14 @@ impl EncodeStage {
         // A frame handed over before switching to inline goes first.
         let queued = self.shared.slot.lock().unwrap().take();
         for job in queued.into_iter().chain([job]) {
-            encode(encoder, &self.shared.out, job, control, out)?;
+            encode(encoder, &self.shared, job, control, out)?;
         }
         Ok(())
     }
 
     /// Average encode time (ms).
     pub fn encode_ms(&self) -> f32 {
-        self.shared.out.lock().unwrap().encode_ms
+        f32::from_bits(self.shared.encode_ms.load(Ordering::Relaxed))
     }
 
     /// Hands over the newest converted frame. Returns whether it replaced
@@ -159,13 +162,13 @@ fn encode_loop(shared: &Shared, control: &Control, out: &broadcast::Sender<Arc<E
         let mut guard = shared.encoder.lock().unwrap();
         let Some(encoder) = guard.as_mut() else { continue };
         let Some(job) = shared.slot.lock().unwrap().take() else { continue };
-        encode(encoder, &shared.out, job, control, out)?;
+        encode(encoder, shared, job, control, out)?;
     }
 }
 
-fn encode(encoder: &mut Encoder, output: &Mutex<Output>, job: Job, control: &Control, out: &broadcast::Sender<Arc<EncodedFrame>>) -> ffi::Result<()> {
+fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, out: &broadcast::Sender<Arc<EncodedFrame>>) -> ffi::Result<()> {
     let Job { mut frame, captured, converted, size, codec } = job;
-    let mut o = output.lock().unwrap();
+    let mut o = shared.out.lock().unwrap();
     let key = control.force_key.swap(false, Ordering::Relaxed);
     frame.set_keyframe(key);
     o.pending.insert(frame.pts(), (captured, size));
@@ -176,7 +179,8 @@ fn encode(encoder: &mut Encoder, output: &Mutex<Output>, job: Job, control: &Con
         let (captured, size) = o.pending.remove(&pkt.pts).unwrap_or((converted, size));
         let ms = captured.elapsed().as_secs_f32() * 1000.0;
         let took = started.elapsed().as_secs_f32() * 1000.0;
-        o.encode_ms = if o.encode_ms == 0.0 { took } else { o.encode_ms * 0.9 + took * 0.1 };
+        let avg = f32::from_bits(shared.encode_ms.load(Ordering::Relaxed));
+        shared.encode_ms.store((if avg == 0.0 { took } else { avg * 0.9 + took * 0.1 }).to_bits(), Ordering::Relaxed);
         {
             let mut t = control.timings.lock().unwrap();
             Timings::add(&mut t.encode, converted.elapsed());
@@ -328,5 +332,14 @@ mod tests {
         assert!(run(&mut o, &mut t, &mut n, 30.0, 50.0, 5.0));
         // Well within the period again: inline.
         assert!(!run(&mut o, &mut t, &mut n, 60.0, 8.0, 1.0));
+    }
+
+    #[test]
+    fn tempo_de_codificacao_nao_espera_o_quadro_em_andamento() {
+        let (tx, _rx) = broadcast::channel(4);
+        let stage = EncodeStage::start(Arc::new(Control::default()), tx);
+        // What `encode` holds for as long as a frame is in the encoder.
+        let _encoding = stage.shared.out.lock().unwrap();
+        assert_eq!(stage.encode_ms(), 0.0);
     }
 }
