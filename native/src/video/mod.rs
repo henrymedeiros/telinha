@@ -542,11 +542,9 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
             let period = Duration::from_secs_f64(1.0 / settings.quality.fps.max(1) as f64);
             // Wakes up for the held frame's turn or for the next repeat, and at
             // least every 50 ms to see stop and quality requests.
-            let wake = match (&early, pacer.due()) {
-                (Some(_), Some(due)) => due,
-                _ => repeats.next_at(period, control.force_key.load(Ordering::Relaxed)),
-            };
-            let timeout = wake.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
+            let held = early.as_ref().and(pacer.due());
+            let repeat = last_input.as_ref().map(|_| repeats.next_at(period, control.force_key.load(Ordering::Relaxed)));
+            let timeout = idle_wait(held, repeat, Instant::now());
             let mut frame = match first.take() {
                 Some(f) => Some(f),
                 None => src.next(timeout),
@@ -754,6 +752,21 @@ impl Repeats {
     }
 }
 
+/// The longest the loop sleeps waiting for a frame, so it still sees stop and
+/// quality requests.
+const IDLE_WAIT: Duration = Duration::from_millis(50);
+
+/// How long to wait for the source's next frame: until the held frame's turn
+/// (`held`), else until the next repeat (`repeat`), and never past `IDLE_WAIT`.
+/// With nothing held and nothing to repeat (`repeat` is `None`: no image has
+/// gone into this pipeline yet) only a new frame can move things along, so it
+/// waits the whole `IDLE_WAIT` instead of coming straight back: without that
+/// the loop spun on a still screen after a rebuild. The wait ends the moment
+/// a frame arrives, so it adds no delay while frames flow.
+fn idle_wait(held: Option<Instant>, repeat: Option<Instant>, now: Instant) -> Duration {
+    held.or(repeat).map_or(IDLE_WAIT, |wake| wake.saturating_duration_since(now).min(IDLE_WAIT))
+}
+
 pub(crate) mod pace {
     use std::time::{Duration, Instant};
 
@@ -955,18 +968,20 @@ mod tests {
         start: Instant,
         ended_at: Option<Duration>,
         dropped: Arc<AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Janela {
         fn new(frames: Vec<(u64, (u32, u32))>, ended_at: Option<u64>) -> (Self, Arc<AtomicBool>) {
             let dropped = Arc::new(AtomicBool::new(false));
             let frames = frames.into_iter().map(|(ms, size)| (Duration::from_millis(ms), size)).collect();
-            (Self { frames, start: Instant::now(), ended_at: ended_at.map(Duration::from_millis), dropped: dropped.clone() }, dropped)
+            (Self { frames, start: Instant::now(), ended_at: ended_at.map(Duration::from_millis), dropped: dropped.clone(), calls: Arc::default() }, dropped)
         }
     }
 
     impl CpuSource for Janela {
         fn next(&mut self, timeout: Duration) -> Option<CpuFrame> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             let elapsed = self.start.elapsed();
             let due = self.frames.front().is_some_and(|(at, _)| *at <= elapsed);
             if !due {
@@ -1041,6 +1056,26 @@ mod tests {
         // The stop request is seen with no frame to wake the loop.
         control.stop.store(true, Ordering::Relaxed);
         assert!(espera(&dropped, 1000), "the video thread did not stop");
+    }
+
+    #[test]
+    fn mudar_a_qualidade_com_a_janela_parada_manda_keyframe_no_tamanho_novo() {
+        let (janela, _dropped) = Janela::new(vec![(0, (1280, 960)), (30, (1280, 960))], None);
+        let calls = janela.calls.clone();
+        let (tx, mut rx) = broadcast::channel(256);
+        let control = start(Source::Cpu(Box::new(janela)), qualidade(), tx);
+        let Some(out) = saida(&control, &mut rx, 700) else { return };
+        assert!(out.iter().all(|f| (f.width, f.height) == (1280, 960)), "before the change");
+        // Nothing more comes from the window, and the person picks 720p.
+        let menor = Quality { resolution: crate::config::Resolution::P720, ..qualidade() };
+        control.reconfigure(Settings { quality: menor, bitrate: menor.bitrate((1280, 960)), codec: Codec::H264 });
+        let before = calls.load(Ordering::Relaxed);
+        let after = saida(&control, &mut rx, 1000).unwrap_or_default();
+        let asked = calls.load(Ordering::Relaxed) - before;
+        control.stop.store(true, Ordering::Relaxed);
+        // It waits for the window instead of asking again at once.
+        assert!(asked < 2000, "the loop spun: it asked the source {asked} times in a second");
+        assert!(after.iter().any(|f| f.key && (f.width, f.height) == (960, 720)), "no keyframe at the new size from a still window");
     }
 
     #[test]
@@ -1127,6 +1162,21 @@ mod tests {
         assert_eq!(r.next_at(p, false), now - p + KEEPALIVE);
         // A keyframe request does not wait for the keepalive.
         assert!(r.next_at(p, true) <= now);
+    }
+
+    #[test]
+    fn sem_nada_para_repetir_espera_em_vez_de_girar() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        // Nothing held, nothing to repeat: the whole wait, not zero.
+        assert_eq!(idle_wait(None, None, now), IDLE_WAIT);
+        // A repeat already due: at once. One due soon: until then.
+        assert_eq!(idle_wait(None, Some(now), now), Duration::ZERO);
+        assert_eq!(idle_wait(None, Some(now + ms(7)), now), ms(7));
+        // A held frame's turn comes before any repeat.
+        assert_eq!(idle_wait(Some(now + ms(3)), Some(now + ms(40)), now), ms(3));
+        // Never past the wait that keeps stop requests seen.
+        assert_eq!(idle_wait(None, Some(now + ms(900)), now), IDLE_WAIT);
     }
 
     #[test]
