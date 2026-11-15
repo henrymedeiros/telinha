@@ -1,8 +1,12 @@
+// TELINHA_VERSION (0.5.2) and TELINHA_VERSION_NUMBERS (0,5,2,0) come from build.rs.
+#define TELINHA_STR2(x) #x
+#define TELINHA_STR(x) TELINHA_STR2(x)
+
 1 ICON "../icons/telinha.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION TELINHA_VERSION_NUMBERS
+PRODUCTVERSION TELINHA_VERSION_NUMBERS
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -11,8 +15,8 @@ BEGIN
       VALUE "CompanyName", "Telinha"
       VALUE "FileDescription", "Telinha: transmissão de tela de baixa latência"
       VALUE "ProductName", "Telinha"
-      VALUE "FileVersion", "0.1.0"
-      VALUE "ProductVersion", "0.1.0"
+      VALUE "FileVersion", TELINHA_STR(TELINHA_VERSION)
+      VALUE "ProductVersion", TELINHA_STR(TELINHA_VERSION)
       VALUE "OriginalFilename", "telinha.exe"
     END
   END

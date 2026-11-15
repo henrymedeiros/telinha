@@ -16,8 +16,14 @@ fn main() {
         }
     }
     if target_os == "windows" {
-        // Icon and version info for the .exe.
-        embed_resource::compile("assets/windows/telinha.rc", embed_resource::NONE).manifest_optional().unwrap();
+        // Icon and version info for the .exe. The version is Cargo.toml's: the
+        // resource wants it as text and as four numbers.
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+        let mut numbers = version.split(['.', '-', '+']).map(|p| p.parse::<u16>().unwrap_or(0));
+        let mut next = || numbers.next().unwrap_or(0);
+        let numbers = format!("TELINHA_VERSION_NUMBERS={},{},{},0", next(), next(), next());
+        println!("cargo:rerun-if-changed=assets/windows/telinha.rc");
+        embed_resource::compile("assets/windows/telinha.rc", [format!("TELINHA_VERSION={version}"), numbers]).manifest_optional().unwrap();
     }
     println!("cargo:rerun-if-env-changed=TELINHA_DEV_RPATH");
     // Embedded default server (option_env!): changing the variable triggers a rebuild.
