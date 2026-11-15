@@ -127,7 +127,8 @@ export function keyWait(lastKeyAt, now) { return Math.max(0, lastKeyAt + KEY_FLO
 // Codecs past H.264 this browser decodes in hardware, for the streamer to
 // choose (the desktop app behind a flag, the site's own sender behind ?enc=).
 // isConfigSupported says "maybe" more than "yes" for hardware: a viewer whose
-// decoder still fails asks for normal WebRTC, as with any other codec.
+// decoder still fails says so, and the streamer goes back to H.264 for it
+// (normal WebRTC only if H.264 fails too).
 // ?dec=hevc claims a list instead (to test the streamer's switch and fallback).
 export async function hardwareDecoders() {
   const claimed = new URLSearchParams(globalThis.location?.search ?? "").get("dec");
