@@ -342,25 +342,26 @@ async fn start(ui: &mpsc::Sender<Event>, name: String, server: Option<String>, c
     let _ = ui.send(Event::Connecting).await;
     let server = server.ok_or("Entre num canal pelo link de convite uma vez, para o app saber qual servidor usar.")?;
     let ice = signaling::ice_servers(&server).await.map_err(server_down)?;
-    let (sig_tx, mut sig_rx) = mpsc::channel(256);
     let (peer_tx, peer_rx) = mpsc::channel(1024);
 
     // Host registers the channel id (tries another number if it is taken).
-    let (me, code, sig) = match code {
+    let (me, code, sig, sig_rx) = match code {
         Some(code) => {
             let me = format!("telinha-app-{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff);
-            let sig = Signaling::connect(&server, &me, sig_tx.clone()).await.map_err(server_down)?;
+            let (sig_tx, mut sig_rx) = mpsc::channel(256);
+            let sig = Signaling::connect(&server, &me, sig_tx).await.map_err(server_down)?;
             wait_open(&mut sig_rx).await.map_err(server_down)?;
-            (me, code, sig)
+            (me, code, sig, sig_rx)
         }
         None => {
             let mut attempt = 0;
             loop {
                 let code = rand::random_range(1000..10000u32).to_string();
                 let me = format!("{PREFIX}{code}");
-                let sig = Signaling::connect(&server, &me, sig_tx.clone()).await.map_err(server_down)?;
+                let (sig_tx, mut sig_rx) = mpsc::channel(256);
+                let sig = Signaling::connect(&server, &me, sig_tx).await.map_err(server_down)?;
                 match wait_open(&mut sig_rx).await {
-                    Ok(()) => break (me, code, sig),
+                    Ok(()) => break (me, code, sig, sig_rx),
                     Err(_) if attempt < 5 => attempt += 1,
                     Err(e) => return Err(server_down(e)),
                 }
@@ -715,6 +716,16 @@ impl Session {
                 }
             }
             Signal::Error(e) => tracing::warn!("server: {e}"),
+            // Video and sound are peer to peer and go on; only new people cannot get in.
+            Signal::Reconnecting => {
+                let _ = self.ui.send(Event::Notice("Sem contato com o servidor. Quem já assiste continua assistindo; tentando reconectar…".into())).await;
+            }
+            // Only reaches here after a reconnect (`start` consumed the ones from
+            // registering): the id went to someone else while the connection was down.
+            Signal::IdTaken => {
+                let _ = self.ui.send(Event::Failed(lost_id_text(matches!(self.role, Role::Host), &self.code))).await;
+                return Err(());
+            }
             _ => {}
         }
         Ok(())
@@ -1650,6 +1661,12 @@ fn is_join(offer: &Value) -> bool {
     offer["type"] == "data" && offer["metadata"]["kind"].is_null()
 }
 
+/// What the person reads when, after a reconnect, the server says the id now
+/// belongs to someone else. For a host that id is the channel number.
+fn lost_id_text(host: bool, code: &str) -> String {
+    if host { format!("Outra pessoa abriu o canal {code} enquanto a conexão com o servidor estava fora. Abra um canal novo.") } else { "A conexão com o servidor caiu.".into() }
+}
+
 /// Whether losing this connection ends the session. A guest's link to the
 /// host is the channel itself: without it there is no member list and nobody
 /// to stream to.
@@ -1699,6 +1716,12 @@ fn rtp_cap(estimates: &[(String, u32)]) -> (Option<u32>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canal_perdido_na_reconexao_diz_o_que_fazer() {
+        assert_eq!(lost_id_text(true, "4821"), "Outra pessoa abriu o canal 4821 enquanto a conexão com o servidor estava fora. Abra um canal novo.");
+        assert_eq!(lost_id_text(false, "4821"), "A conexão com o servidor caiu.");
+    }
 
     #[test]
     fn so_video_por_rtp_no_relay_conta_para_o_teto() {
