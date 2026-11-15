@@ -22,6 +22,18 @@ const TURBO = turboSupport();
 const DECODERS = hardwareDecoders().catch(() => []); // goes with "wc" in the roster
 const PREFIX = "telinha-canal-v1-";
 const MAX_BITRATE = 8_000_000;
+// Everyone in a channel, the host included. Each viewer costs the streamer one
+// more copy of the video and 4 or 5 work well (docs/how-it-works.md, Limits):
+// this is more than twice that, and it is the most connections a stranger who
+// guessed the number can make a streamer open.
+const MAX_PEOPLE = 12;
+// Connections to the host still opening at once. A real group joins one by one,
+// about a second each; a burst past this is closed before it costs anything.
+const MAX_JOINING = 6;
+// Same wait a guest gives the host (connectTo).
+const JOIN_TIMEOUT_MS = 15000;
+// Faces kept drawn. Names are other people's and never stop changing.
+const MAX_FACES = 64;
 const $ = (id) => document.getElementById(id);
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 // Phones and tablets can watch but not share: no screen capture API there.
@@ -184,9 +196,22 @@ async function host(attempt = 0) {
   }
 }
 
+const joining = new Set(); // host: connections that have not opened yet
 function acceptGuest(conn) {
   if (conn.metadata?.kind === "turbo") return; // minimum-latency video, handled in wirePeer
+  // More opening at once than a real group ever does: not worth a connection.
+  if (joining.size >= MAX_JOINING) { conn.close(); return; }
+  joining.add(conn);
+  const giveUp = setTimeout(() => { if (joining.delete(conn)) conn.close(); }, JOIN_TIMEOUT_MS);
   conn.on("open", () => {
+    clearTimeout(giveUp);
+    joining.delete(conn);
+    if (state.roster.size >= MAX_PEOPLE && !state.roster.has(conn.peer)) {
+      // Full: says so, and hangs up once the message had time to leave.
+      conn.send({ t: "full" });
+      setTimeout(() => conn.close(), 500);
+      return;
+    }
     const name = String(conn.metadata?.name || "Alguém").slice(0, 24);
     state.guests.set(conn.peer, conn);
     state.roster.set(conn.peer, { name, sharing: false, wc: !!conn.metadata?.wc, dec: decoderList(conn.metadata?.dec) });
@@ -200,7 +225,9 @@ function acceptGuest(conn) {
     }
   });
   const gone = () => {
-    if (!state.guests.has(conn.peer)) return;
+    clearTimeout(giveUp);
+    joining.delete(conn);
+    if (state.guests.get(conn.peer) !== conn) return;
     state.guests.delete(conn.peer);
     state.roster.delete(conn.peer);
     broadcastRoster();
@@ -230,6 +257,7 @@ async function join(code) {
     state.hostConn = conn;
     conn.on("data", (msg) => {
       if (msg?.t === "roster" && Array.isArray(msg.members)) applyRoster(msg.members);
+      else if (msg?.t === "full") channelFull();
     });
     conn.on("close", () => offAir());
     wirePeer(peer);
@@ -1556,6 +1584,13 @@ function leave() {
   state.localStream?.getTracks().forEach((t) => t.stop());
   state.peer?.destroy();
   location.href = location.pathname;
+}
+
+// The host turned this page away: the channel has as many people as it takes.
+function channelFull() {
+  $("offairTitle").textContent = "O canal está cheio";
+  ui.offairText.textContent = `Não cabe mais ninguém no canal ${state.code}. Tente de novo daqui a pouco ou abra outro canal.`;
+  offAir();
 }
 
 function offAir() {
