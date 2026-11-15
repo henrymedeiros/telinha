@@ -76,63 +76,23 @@ if (!/android|iphone|ipad/i.test(navigator.userAgent)) {
     .then((r) => { if (r.ok) $("getApp").hidden = false; })
     .catch(() => {});
 }
-// Invite: #1234. The Discord bot's Watch button also brings a pass
-// (#1234/passe), which is removed from the address bar so it is not copy-pasted along.
-// The bot's /new-telinha opens #novo/<name>/<avatar>: a new channel right away,
-// as that Discord person.
-const [hashRaw = "", hashPass = "", hashAvatar = ""] = location.hash.slice(1).split("/");
+// Invite: #1234.
+const hashCode = location.hash.slice(1).split("/")[0].replace(/\D/g, "").slice(0, 4);
 // This tab was in a channel and did not close normally: the browser killed the
 // page, out of sight ("hidden": a phone that left the browser) or in plain view
 // ("visible": it crashed). Sent with the next join, for the streamer's log.
 let lastPageEnd = (() => { try { return sessionStorage.getItem("telinha:watching") || ""; } catch { return ""; } })();
 window.addEventListener("pagehide", (e) => { if (!e.persisted) safeSession("telinha:watching", null); });
-const opening = hashRaw === "novo";
-const hashCode = opening ? "" : hashRaw.replace(/\D/g, "").slice(0, 4);
-let discordPass = opening ? "" : hashPass.trim();
-if (discordPass) history.replaceState(null, "", `${location.pathname}${location.search}#${hashCode}`);
-if (opening) {
-  const decode = (s) => { try { return decodeURIComponent(s); } catch { return ""; } };
-  const name = decode(hashPass).trim().slice(0, 24);
-  if (!ui.name.value.trim() && name) ui.name.value = name;
-  if (isDiscordAvatar(decode(hashAvatar))) safeSet("telinha:avatar", decode(hashAvatar));
-  history.replaceState(null, "", `${location.pathname}${location.search}`);
-}
-// Watch link opened in a tab already in the channel: the browser only changes
-// the "#" and does not reload the page, so the new pass arrives here.
-window.addEventListener("hashchange", () => {
-  const [raw = "", pass = ""] = location.hash.slice(1).split("/");
-  if (raw === "novo") return location.reload(); // another "Abrir canal novo" click
-  if (!pass.trim()) return;
-  discordPass = pass.trim();
-  history.replaceState(null, "", `${location.pathname}${location.search}#${raw.replace(/\D/g, "").slice(0, 4)}`);
-  passStatus.clear();
-  if (state.peer) for (const [id, m] of state.members) if (id !== state.peer.id && m.sharing && m.discord) deliverPass(id);
-  renderStreams();
-});
-// Discord identity carried by the pass (name and avatar), used when the
-// person has no name saved yet; the avatar is remembered for next visits.
-const passIdentity = (() => {
-  try { return JSON.parse(atob(discordPass.split(".")[0].replace(/-/g, "+").replace(/_/g, "/"))); } catch { return {}; }
-})();
-if (!ui.name.value && passIdentity.n) ui.name.value = String(passIdentity.n).slice(0, 24);
-if (isDiscordAvatar(passIdentity.a)) safeSet("telinha:avatar", passIdentity.a);
-const myAvatar = isDiscordAvatar(safeGet("telinha:avatar")) ? safeGet("telinha:avatar") : "";
 if (hashCode.length === 4) {
   ui.code.value = hashCode;
   // Channel in the link: straight into it, with a funny name if there is none yet.
   setTimeout(() => join(hashCode), 0);
 }
-if (opening) setTimeout(() => host(), 0);
 syncLobby();
 
 /** Codec names a browser reported (hardwareDecoders), kept short and few. */
 function decoderList(v) {
   return Array.isArray(v) ? v.filter((d) => typeof d === "string" && d.length <= 8).slice(0, 4) : [];
-}
-
-/** Only Discord's avatar CDN: nobody can make others load an arbitrary URL. */
-function isDiscordAvatar(url) {
-  return typeof url === "string" && url.startsWith("https://cdn.discordapp.com/avatars/");
 }
 
 ui.tv.addEventListener("pointerdown", (e) => {
@@ -211,7 +171,7 @@ async function host(attempt = 0) {
     state.peer = peer;
     state.isHost = true;
     state.code = code;
-    state.roster.set(peer.id, { name: state.name, avatar: myAvatar, sharing: false, wc: TURBO.receive, dec: await DECODERS });
+    state.roster.set(peer.id, { name: state.name, sharing: false, wc: TURBO.receive, dec: await DECODERS });
     peer.on("connection", acceptGuest);
     wirePeer(peer);
     broadcastRoster();
@@ -229,15 +189,13 @@ function acceptGuest(conn) {
   conn.on("open", () => {
     const name = String(conn.metadata?.name || "Alguém").slice(0, 24);
     state.guests.set(conn.peer, conn);
-    const avatar = isDiscordAvatar(conn.metadata?.avatar) ? conn.metadata.avatar : "";
-    state.roster.set(conn.peer, { name, avatar, sharing: false, wc: !!conn.metadata?.wc, dec: decoderList(conn.metadata?.dec) });
+    state.roster.set(conn.peer, { name, sharing: false, wc: !!conn.metadata?.wc, dec: decoderList(conn.metadata?.dec) });
     broadcastRoster();
   });
   conn.on("data", (msg) => {
     if (msg?.t === "sharing" && state.roster.has(conn.peer)) {
       const m = state.roster.get(conn.peer);
       m.sharing = !!msg.on;
-      m.discord = !!msg.on && !!msg.discord; // only people in the Discord call can watch
       broadcastRoster();
     }
   });
@@ -265,7 +223,7 @@ async function join(code) {
   let peer;
   try {
     peer = await openPeer();
-    const conn = await connectTo(peer, PREFIX + code, { name: state.name, avatar: myAvatar, wc: TURBO.receive, dec: await DECODERS, restart: lastPageEnd });
+    const conn = await connectTo(peer, PREFIX + code, { name: state.name, wc: TURBO.receive, dec: await DECODERS, restart: lastPageEnd });
     lastPageEnd = "";
     state.peer = peer;
     state.code = code;
@@ -503,41 +461,9 @@ function closeIncoming(id) {
   removeStream(id);
 }
 
-/* ---------------- Discord pass ---------------- */
-
-// A sharer using the app with "call only" sends video only to those who present
-// a pass signed by the Discord bot. The pass goes directly to that person
-// (never through the channel roster, which everyone sees).
-const passStatus = new Map(); // sharer id → { ok, motivo } | "enviando"
-
-function passTarget() {
-  try {
-    const body = discordPass.split(".")[0].replace(/-/g, "+").replace(/_/g, "/");
-    return JSON.parse(atob(body)).p ?? null;
-  } catch { return null; }
-}
-
-function deliverPass(id) {
-  if (!discordPass || passStatus.has(id) || passTarget() !== id) return;
-  passStatus.set(id, "enviando");
-  const conn = state.peer.connect(id, { metadata: { kind: "passe", passe: discordPass }, reliable: true, serialization: "json" });
-  conn.on("data", (msg) => {
-    if (msg?.t !== "passe") return;
-    setTimeout(() => conn.close(), 500);
-    // The sharer is still linking the stream to Discord: try again.
-    if (!msg.ok && msg.tentar) {
-      setTimeout(() => { passStatus.delete(id); if (state.members.get(id)?.discord) deliverPass(id); }, 3000);
-      return;
-    }
-    passStatus.set(id, { ok: !!msg.ok, motivo: msg.motivo });
-    renderStreams();
-  });
-  conn.on("error", () => { passStatus.delete(id); });
-}
-
 function applyRoster(list) {
   const me = state.peer.id;
-  const next = new Map(list.map((m) => [m.id, { name: m.name, avatar: isDiscordAvatar(m.avatar) ? m.avatar : "", sharing: !!m.sharing, wc: !!m.wc, dec: decoderList(m.dec), discord: !!m.discord }]));
+  const next = new Map(list.map((m) => [m.id, { name: m.name, sharing: !!m.sharing, wc: !!m.wc, dec: decoderList(m.dec) }]));
 
   for (const [id, prev] of state.members) {
     if (id === me) continue;
@@ -563,7 +489,6 @@ function applyRoster(list) {
     else if (left) playChime("leave");
   }
   state.members = next;
-  for (const [id, m] of next) if (id !== me && m.sharing && m.discord) deliverPass(id);
 
   if (state.localStream) for (const id of next.keys()) if (id !== me && !state.outgoing.has(id)) connectMember(id);
   for (const [id, s] of state.streams) if (!s.local && next.has(id)) s.name = next.get(id).name;
@@ -1098,35 +1023,21 @@ function addStream(id, stream, name, local, view = null) {
   renderStreams();
 }
 
-// Empty stage: explains what to do when the stream is call-only.
+// Empty stage: says whether a picture is on its way.
 function renderEmpty() {
   const me = state.peer?.id;
-  const gated = [...state.members].find(([id, m]) => id !== me && m.sharing && m.discord);
   const sharing = [...state.members].find(([id, m]) => id !== me && m.sharing);
-  if (!gated && sharing) {
+  if (sharing) {
     // Someone is on the air and the picture is on its way (joining, or
     // switching how it travels): not an empty channel.
     ui.emptyTitle.textContent = `Conectando à tela de ${sharing[1].name}…`;
     ui.emptyText.textContent = "A imagem aparece em instantes.";
     return;
   }
-  if (!gated) {
-    ui.emptyTitle.textContent = "Ninguém está transmitindo";
-    ui.emptyText.textContent = CAN_SHARE
-      ? "Compartilhe sua tela ou mande o convite pra galera entrar."
-      : "Quando alguém transmitir, a imagem aparece aqui.";
-    return;
-  }
-  const [id, m] = gated;
-  const st = passStatus.get(id);
-  ui.emptyTitle.textContent = `${m.name} transmite só pra call`;
-  ui.emptyText.textContent =
-    st === "enviando" ? "Conferindo seu passe…"
-    : st?.ok ? "Passe aceito. A imagem já vai aparecer."
-    : st?.motivo ? st.motivo
-    // Pass from a previous stream (the sharer's app restarted).
-    : discordPass ? "Seu passe é de uma transmissão anterior. Clique em Assistir de novo no chat da call."
-    : "Entre na call do Discord e clique em Assistir no chat dela.";
+  ui.emptyTitle.textContent = "Ninguém está transmitindo";
+  ui.emptyText.textContent = CAN_SHARE
+    ? "Compartilhe sua tela ou mande o convite pra galera entrar."
+    : "Quando alguém transmitir, a imagem aparece aqui.";
 }
 
 function dropThumb(s) {
@@ -1468,10 +1379,10 @@ function faceFor(name) {
 }
 
 function avatarFor(el, id, m) {
-  // Discord photo first, then the face, then the initials.
-  const picture = m.avatar || faceFor(m.name);
-  el.textContent = picture ? "" : initials(m.name);
-  el.style.background = picture ? `center / cover no-repeat url("${picture}")` : AVATAR_COLORS[hash(m.name + id) % AVATAR_COLORS.length];
+  // The face drawn here from the name, or the initials until it loads.
+  const face = faceFor(m.name);
+  el.textContent = face ? "" : initials(m.name);
+  el.style.background = face ? `center / cover no-repeat url("${face}")` : AVATAR_COLORS[hash(m.name + id) % AVATAR_COLORS.length];
   return el;
 }
 
