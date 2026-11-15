@@ -63,7 +63,7 @@ linux() {
   cp assets/linux/AppRun "$A/AppRun"
   cp assets/linux/telinha.desktop "$A/telinha.desktop"
   cp assets/icons/telinha.png "$A/telinha.png"
-  ARCH=x86_64 "$D/appimagetool" --appimage-extract-and-run --no-appstream "$A" "dist/Telinha-${VERSION}-x86_64.AppImage" >/dev/null
+  ARCH=x86_64 "$D/appimagetool" --appimage-extract-and-run --no-appstream --runtime-file "$D/appimage-runtime" "$A" "dist/Telinha-${VERSION}-x86_64.AppImage" >/dev/null
   rm -rf "$A"
 }
 
