@@ -481,7 +481,11 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
         }
         // Quality change: only the bitrate if that is all; everything if the size changed.
         // A failure keeps the stream going with what it had.
-        if let Some(next) = control.pending.lock().unwrap().take() {
+        // Taken out on a line of its own: the lock is gone before anything slow
+        // happens. The session asks for changes from its own task and must never
+        // wait for a rebuild.
+        let next = control.pending.lock().unwrap().take();
+        if let Some(next) = next {
             if next != settings {
                 let rebuild_all = next.quality.output_size(native) != settings.quality.output_size(native)
                     || next.quality.fps != settings.quality.fps
