@@ -1355,7 +1355,7 @@ impl Session {
             .filter(|m| m.id != self.me)
             .map(|m| (m.wc && !self.demoted.contains(&m.id), m.dec.iter().filter_map(|d| video::Codec::from_name(d)).filter(|c| !self.refused.contains(&(m.id.clone(), *c))).collect()))
             .collect();
-        let allowed: Vec<video::Codec> = extra_codecs(std::env::var_os("TELINHA_HEVC").is_some(), std::env::var_os("TELINHA_AV1").is_some()).into_iter().filter(|c| !self.cannot_encode.contains(c)).collect();
+        let allowed = self.cannot_encode.iter().fold(extra_codecs(std::env::var_os("TELINHA_HEVC").is_some(), std::env::var_os("TELINHA_AV1").is_some()), |allowed, c| after_refusal(&allowed, *c));
         let wanted = pick_codec(&allowed, &viewers, rtp);
         let Some(live) = &mut self.live else { return };
         if wanted != live.codec {
@@ -1556,6 +1556,13 @@ impl Session {
             let msg = format!("A transmissão parou: {e}");
             self.stop_live().await;
             let _ = self.ui.send(Event::Failed(msg)).await;
+            return;
+        }
+        if let Some((refused, in_effect)) = live.control.take_codec_refused() {
+            tracing::warn!(codec = ?refused, "this machine could not encode it; not asking again");
+            live.codec = in_effect;
+            self.cannot_encode.insert(refused);
+            self.follow_codec();
             return;
         }
         // What was being shared is gone (a window closed): the channel stays.
@@ -1770,6 +1777,11 @@ fn extra_codecs(hevc: bool, av1: bool) -> Vec<video::Codec> {
     [(av1, video::Codec::Av1), (hevc, video::Codec::Hevc)].into_iter().filter(|(on, _)| *on).map(|(_, c)| c).collect()
 }
 
+/// After a refusal: what the stream is on now, and what may still be asked for.
+fn after_refusal(allowed: &[video::Codec], refused: video::Codec) -> Vec<video::Codec> {
+    allowed.iter().copied().filter(|c| *c != refused).collect()
+}
+
 /// Whether a connection's path says its viewer gets the video through the
 /// relay. `None`: this connection carries no RTP video, so it says nothing —
 /// data channel viewers report the relay themselves (and are moved to RTP for
@@ -1957,6 +1969,17 @@ mod tests {
         assert_eq!(extra_codecs(false, false), vec![]);
         assert_eq!(extra_codecs(true, false), vec![Hevc]);
         assert_eq!(extra_codecs(true, true), vec![Av1, Hevc]);
+    }
+
+    #[test]
+    fn codec_recusado_nao_volta() {
+        use video::Codec::{Av1, H264, Hevc};
+        let v = |list: &[(bool, &[video::Codec])]| list.iter().map(|(t, d)| (*t, d.to_vec())).collect::<Vec<_>>();
+        assert_eq!(after_refusal(&[Av1, Hevc], Av1), [Hevc]);
+        assert_eq!(after_refusal(&[Hevc], Hevc), []);
+        assert_eq!(after_refusal(&[Av1, Hevc], H264), [Av1, Hevc]);
+        // The next codec everyone decodes takes over.
+        assert_eq!(pick_codec(&after_refusal(&[Av1, Hevc], Av1), &v(&[(true, &[Av1, Hevc])]), false), Hevc);
     }
 
     #[test]
