@@ -395,14 +395,14 @@ pub(crate) fn render_node() -> String {
 /// Rebuilds everything for `next`. The old pipeline goes first (NVENC
 /// allows only a few sessions per GPU, and with the old one open the build
 /// could settle for a worse encoder); if `next` fails, back to `current`.
-fn rebuild(pipe: Pipeline, stage: &EncodeStage, kind: SourceKind, native: (u32, u32), pixel: ff::AVPixelFormat, current: Settings, next: Settings, origin: &Origin) -> ffi::Result<(Pipeline, Settings)> {
+fn rebuild(pipe: Pipeline, stage: &EncodeStage, kind: SourceKind, native: (u32, u32), pixel: ff::AVPixelFormat, current: Settings, next: Settings, origin: &Origin, rejected: Option<Rejected>) -> ffi::Result<(Pipeline, Settings)> {
     drop(stage.remove());
     drop(pipe);
-    let (pipe, encoder, settings) = match build(kind, native, pixel, &next, 0, origin) {
+    let (pipe, encoder, settings) = match build(kind, native, pixel, &next, start_at(rejected, kind, next.codec), origin) {
         Ok((p, e)) => (p, e, next),
         Err(e) => {
             tracing::warn!("new quality failed ({e}); keeping the previous one");
-            let (p, e) = build(kind, native, pixel, &current, 0, origin)?;
+            let (p, e) = build(kind, native, pixel, &current, start_at(rejected, kind, current.codec), origin)?;
             (p, e, current)
         }
     };
@@ -525,7 +525,10 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
     let mut captured_at: HashMap<i64, Instant> = HashMap::new();
     let mut pts: i64 = 0;
     let mut filtered = Frame::new();
-    publish_encoder(control, &pipe, native);
+    let mut trial = Trial::new(0);
+    let mut rejected: Option<Rejected> = None;
+    // An error on a frame, on its way to the top of the loop.
+    let mut failed: Option<ffi::Error> = None;
     // Last image received, to re-encode while the screen is static.
     let mut last_input: Option<Frame> = None;
     let mut repeats = Repeats::new(Instant::now());
@@ -538,9 +541,47 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
     let mut resize = Resize::default();
     let mut resized: Option<CpuFrame> = None;
 
-    loop {
+    'frames: loop {
         if control.stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        let encoded = control.stats.lock().unwrap().encoded;
+        if let Some(e) = failed.take() {
+            // Packets already came out of this pipeline: something broke
+            // mid-stream (a lost device, a changed display). That ends the
+            // stream and the person is told; quietly moving to another encoder
+            // would hide it.
+            if trial.proven(encoded) {
+                return Err(e);
+            }
+            let name = encoders::candidates()[pipe.candidate].encoder;
+            tracing::warn!(encoder = name, "the encoder opened but failed on its first frames ({e}); trying the next one");
+            let next = pipe.candidate + 1;
+            rejected = Some(Rejected { kind, codec: settings.codec, next });
+            // The old one goes first, as in `rebuild`.
+            drop(stage.remove());
+            drop(pipe);
+            let encoder;
+            (pipe, encoder) = match build(kind, native, pixel, &settings, next, &origin) {
+                Ok(built) => built,
+                // Nothing else works: what is reported is why the last one failed.
+                Err(none) => {
+                    tracing::warn!("no other encoder to try: {none}");
+                    return Err(e);
+                }
+            };
+            stage.install(encoder);
+            trial = Trial::new(control.stats.lock().unwrap().encoded);
+            // A DMA-BUF image was wrapped for the old pipeline's frames context.
+            if kind == SourceKind::Prime {
+                last_input = None;
+            }
+            control.gop.lock().unwrap().clear();
+            control.request_key();
+        }
+        if !trial.announced && trial.proven(encoded) {
+            publish_encoder(control, &pipe, native);
+            trial.announced = true;
         }
         // Quality change: only the bitrate if that is all; everything if the size changed.
         // A failure keeps the stream going with what it had.
@@ -554,7 +595,8 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                 Change::Nothing => settings.quality = next.quality,
                 change => {
                     if change == Change::Rebuild {
-                        (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin)?;
+                        (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin, rejected)?;
+                        trial = Trial::new(control.stats.lock().unwrap().encoded);
                         // The last image goes into the new pipeline too: a still
                         // screen then gets its keyframe at the new size without
                         // waiting for the source to repaint. Not a DMA-BUF one: it
@@ -574,7 +616,6 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                     // Frames from before the change do not lead into the ones after it.
                     control.gop.lock().unwrap().clear();
                     control.request_key();
-                    publish_encoder(control, &pipe, native);
                 }
             }
         }
@@ -650,7 +691,7 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                         drop(stage.remove());
                         drop(pipe);
                         let encoder;
-                        (pipe, encoder) = build(kind, native, pixel, &next, 0, &origin)?;
+                        (pipe, encoder) = build(kind, native, pixel, &next, start_at(rejected, kind, next.codec), &origin)?;
                         stage.install(encoder);
                         settings = next;
                         // Read on the way out of the DMA-BUF arm below, the only one that can skip.
@@ -660,7 +701,7 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                         }
                         control.gop.lock().unwrap().clear();
                         control.request_key();
-                        publish_encoder(control, &pipe, native);
+                        trial = Trial::new(control.stats.lock().unwrap().encoded);
                     }
                     pts += 1;
                     captured_at.insert(pts, f.captured);
@@ -682,7 +723,10 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                     last_input = av.share();
                     pacer.sent(now);
                     repeats.real(now);
-                    pipe.graph.push(&mut av)?;
+                    if let Err(e) = pipe.graph.push(&mut av) {
+                        failed = Some(e);
+                        continue 'frames;
+                    }
                 }
                 // The compositor only sends a frame when the screen changes. When static,
                 // we re-encode the last image (like Sunshine): a few times right
@@ -697,7 +741,10 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                             repeats.repeated(now);
                             captured_at.insert(pts, now);
                             convert_from = Some(Instant::now());
-                            pipe.graph.push(&mut av)?;
+                            if let Err(e) = pipe.graph.push(&mut av) {
+                                failed = Some(e);
+                                continue 'frames;
+                            }
                         }
                         None => got_input = false,
                     }
@@ -708,7 +755,15 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
             continue;
         }
 
-        while pipe.graph.pull(&mut filtered)? {
+        loop {
+            match pipe.graph.pull(&mut filtered) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    failed = Some(e);
+                    continue 'frames;
+                }
+            }
             let t0 = Instant::now();
             let mut convert_ms = 0.0;
             if let Some(from) = convert_from.take() {
@@ -732,10 +787,14 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                     control.stats.lock().unwrap().skipped += 1;
                 }
             } else {
-                stage.encode_here(job, control, &out)?;
+                if let Err(e) = stage.encode_here(job, control, &out) {
+                    failed = Some(e);
+                    continue 'frames;
+                }
             }
             if let Some(e) = stage.failure() {
-                return Err(e);
+                failed = Some(e);
+                continue 'frames;
             }
             if captured_at.len() > 240 {
                 captured_at.clear();
