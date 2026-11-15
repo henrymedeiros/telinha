@@ -323,26 +323,35 @@ pub fn candidates() -> Vec<Candidate> {
         chain: |c| cpu_convert(c, "yuv420p"),
         options: openh264_opts,
     });
-    let hevc: Vec<Candidate> = v.iter().filter_map(hevc).collect();
+    // `build` only tries the candidates of the codec it was asked for, so the
+    // groups never compete; inside each, the H.264 order stands.
+    let hevc: Vec<Candidate> = v.iter().filter_map(|c| twin(c, Codec::Hevc)).collect();
+    let av1: Vec<Candidate> = v.iter().filter_map(|c| twin(c, Codec::Av1)).collect();
     v.extend(hevc);
+    v.extend(av1);
     v
 }
 
-/// The HEVC twin of a hardware H.264 candidate: same chain and device, the
-/// same low-latency settings (no B-frames, IDR on demand, constant bitrate),
-/// Main profile. Software H.264 has none (no HEVC encoder is shipped).
-fn hevc(c: &Candidate) -> Option<Candidate> {
-    let encoder = match c.encoder {
-        "h264_nvenc" => "hevc_nvenc",
-        "h264_vaapi" => "hevc_vaapi",
-        "h264_amf" => "hevc_amf",
-        "h264_qsv" => "hevc_qsv",
+/// The HEVC or AV1 twin of a hardware H.264 candidate: same chain and device,
+/// the same low-latency settings (no B-frames, IDR on demand, constant
+/// bitrate), Main profile, 8-bit. Software H.264 has none (the software HEVC
+/// and AV1 encoders are far too slow for a live screen).
+fn twin(c: &Candidate, codec: Codec) -> Option<Candidate> {
+    let encoder = match (c.encoder, codec) {
+        ("h264_nvenc", Codec::Hevc) => "hevc_nvenc",
+        ("h264_vaapi", Codec::Hevc) => "hevc_vaapi",
+        ("h264_amf", Codec::Hevc) => "hevc_amf",
+        ("h264_qsv", Codec::Hevc) => "hevc_qsv",
+        ("h264_nvenc", Codec::Av1) => "av1_nvenc",
+        ("h264_vaapi", Codec::Av1) => "av1_vaapi",
+        ("h264_amf", Codec::Av1) => "av1_amf",
+        ("h264_qsv", Codec::Av1) => "av1_qsv",
         _ => return None,
     };
     Some(Candidate {
         label: c.label,
         encoder,
-        codec: Codec::Hevc,
+        codec,
         hardware: c.hardware,
         device: c.device,
         source: c.source,
@@ -352,15 +361,97 @@ fn hevc(c: &Candidate) -> Option<Candidate> {
 }
 
 /// The candidate's options for its codec: HEVC takes Main where H.264 asks
-/// for High.
+/// for High. AV1 has its own tables, with no profile option (every encoder
+/// defaults to Main, 8-bit): its options differ from H.264's in names and
+/// values, so they are not derived from the H.264 table.
 pub fn options(c: &Candidate, ctx: &Ctx) -> Vec<(&'static str, String)> {
     let mut opts = (c.options)(ctx);
-    if c.codec == Codec::Hevc {
-        for (k, v) in &mut opts {
-            if *k == "profile" {
-                *v = "main".into();
+    match c.codec {
+        Codec::H264 => {}
+        Codec::Hevc => {
+            for (k, v) in &mut opts {
+                if *k == "profile" {
+                    *v = "main".into();
+                }
             }
+        }
+        Codec::Av1 => {
+            let low_power = opts.iter().any(|(k, _)| *k == "low_power");
+            opts = av1_opts(c.encoder, low_power);
         }
     }
     opts
+}
+
+/// The AV1 options of each encoder, read from the bundled FFmpeg's
+/// `-h encoder=…` output but not yet run on real AV1 hardware.
+fn av1_opts(encoder: &str, low_power: bool) -> Vec<(&'static str, String)> {
+    match encoder {
+        "av1_nvenc" => vec![
+            o("preset", "p1"),
+            o("tune", "ull"),
+            o("zerolatency", "1"),
+            o("delay", "0"),
+            o("forced-idr", "1"),
+            o("rc", "cbr"),
+            o("surfaces", "1"),
+        ],
+        "av1_vaapi" => {
+            let mut v = vec![o("rc_mode", "CBR"), o("async_depth", "1")];
+            // Only where the H.264 twin asks for it: the full-power candidate covers cards without a low-power mode.
+            if low_power {
+                v.push(o("low_power", "1"));
+            }
+            v
+        }
+        // header_insertion_mode=frame is "aligned to key frames" here, and latency is an enum, unlike H.264's boolean.
+        "av1_amf" => vec![
+            o("usage", "ultralowlatency"),
+            o("quality", "speed"),
+            o("rc", "cbr"),
+            o("forced_idr", "1"),
+            o("header_insertion_mode", "frame"),
+            o("latency", "lowest_latency"),
+            o("async_depth", "1"),
+            o("preencode", "0"),
+            o("enforce_hrd", "1"),
+        ],
+        "av1_qsv" => vec![o("preset", "veryfast"), o("async_depth", "1"), o("low_delay_brc", "1"), o("forced_idr", "1")],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GPU_H264: [&str; 4] = ["h264_nvenc", "h264_vaapi", "h264_amf", "h264_qsv"];
+
+    #[test]
+    fn cada_h264_de_gpu_tem_gemeos() {
+        let all = candidates();
+        let count = |codec: Codec| all.iter().filter(|c| c.codec == codec).count();
+        let gpu_h264 = all.iter().filter(|c| c.codec == Codec::H264 && GPU_H264.contains(&c.encoder)).count();
+        assert!(gpu_h264 > 0);
+        assert_eq!(count(Codec::Hevc), count(Codec::Av1));
+        assert_eq!(count(Codec::Hevc), gpu_h264);
+        for c in all.iter().filter(|c| c.codec != Codec::H264) {
+            assert!(!c.encoder.starts_with("lib") && !c.encoder.ends_with("_mf"), "{}", c.encoder);
+        }
+    }
+
+    #[test]
+    fn opcoes_do_av1_nao_herdam_as_do_h264() {
+        let ctx = Ctx { native: (1920, 1080), out: (1920, 1080), fps: 60, capture: None, corner: (0, 0) };
+        let all = candidates();
+        let av1: Vec<&Candidate> = all.iter().filter(|c| c.codec == Codec::Av1).collect();
+        assert!(!av1.is_empty());
+        for c in av1 {
+            let opts = options(c, &ctx);
+            for (k, _) in &opts {
+                assert!(!["profile", "sei", "aud"].contains(k), "{}: {k}", c.encoder);
+            }
+            assert!(opts.iter().any(|(k, _)| *k == "rc" || *k == "rc_mode"), "{}", c.encoder);
+        }
+    }
 }
