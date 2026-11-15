@@ -17,6 +17,7 @@
 // --sinal-local runs sinal.mjs (a PeerJS-compatible signaling server) on a free port
 // and uses it as --server, so --nativo works without the real server. --query adds
 // parameters to the viewer's URL (render=rtp keeps it off the data channel video).
+// For a capped or jittery network run it through netem-netns.sh (see its header).
 //
 // --server points the app at the signaling/TURN server (deploy/). Without it,
 // the app served on localhost uses public PeerJS, STUN only, and --relay does not connect.

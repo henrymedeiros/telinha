@@ -44,6 +44,8 @@ EXTRA="--warmup 15 --server YOUR_DOMAIN" ./run-suite.sh ../.. novo.jsonl novo 3 
 node summarize.mjs novo.jsonl
 ```
 
+`measure.mjs --sinal-local` needs no server; `tools/latency/netem-netns.sh` runs it behind a capped or jittery network without root (its header has examples), which is how a congestion problem is reproduced before the bitrate logic is changed.
+
 ## Audio
 
 * **Windows:** in Chrome's share window, pick the entire screen and check **Share system audio**.
