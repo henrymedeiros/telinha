@@ -35,7 +35,7 @@ linux() {
   BINDGEN_EXTRA_CLANG_ARGS="-I$(ls -d /usr/lib/llvm-*/lib/clang/*/include | tail -1) -I/usr/include/x86_64-linux-gnu -I/usr/include" \
   RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined $REMAP" \
   PKG_CONFIG_LIBDIR="$D/sysroot/usr/lib/x86_64-linux-gnu/pkgconfig" \
-    cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.35
+    cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.35
   BIN="target/x86_64-unknown-linux-gnu/release/telinha"
 
   # Bundled libraries: FFmpeg and libva (the rest comes from the system).
@@ -76,7 +76,7 @@ windows() {
   # RUSTFLAGS replaces .cargo/config.toml's target flags, so crt-static is repeated here.
   PATH="$XB:$PATH" FFMPEG_DIR="$D/ffmpeg-win" XWIN_ACCEPT_LICENSE=1 \
   RUSTFLAGS="-C target-feature=+crt-static $REMAP" \
-    cargo xwin build --release --target x86_64-pc-windows-msvc
+    cargo xwin build --release --locked --target x86_64-pc-windows-msvc
   S="dist/stage-windows"
   rm -rf "$S" && mkdir -p "$S"
   cp target/x86_64-pc-windows-msvc/release/telinha.exe "$S/"
