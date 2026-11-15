@@ -21,7 +21,7 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use super::ffi::{self, Encoder, Frame};
-use super::{Codec, Control, EncodedFrame, Timings, h264, h265};
+use super::{Codec, Control, EncodedFrame, Timings, av1, h264, h265};
 
 /// A converted frame on its way to the encoder.
 pub struct Job {
@@ -51,6 +51,7 @@ struct Shared {
 struct Output {
     headers: h264::Headers,
     hevc: h265::Headers,
+    av1: av1::Headers,
     /// pts -> (capture time, size), for packets that come out after their frame.
     pending: HashMap<i64, (Instant, (u32, u32))>,
     index: u64,
@@ -67,7 +68,7 @@ impl EncodeStage {
             slot: Mutex::new(None),
             ready: Condvar::new(),
             encoder: Mutex::new(None),
-            out: Mutex::new(Output { headers: h264::Headers::default(), hevc: h265::Headers::default(), pending: HashMap::new(), index: 0 }),
+            out: Mutex::new(Output { headers: h264::Headers::default(), hevc: h265::Headers::default(), av1: av1::Headers::default(), pending: HashMap::new(), index: 0 }),
             encode_ms: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
@@ -212,7 +213,10 @@ fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, o
                 let data = o.hevc.fix_keyframe(pkt.data, pkt.key);
                 (data, o.hevc.codec())
             }
-            Codec::Av1 => (pkt.data, None),
+            Codec::Av1 => {
+                let data = o.av1.fix_keyframe(pkt.data, pkt.key);
+                (data, o.av1.codec())
+            }
         };
         let Some(codec) = codec else { continue };
         o.index += 1;
