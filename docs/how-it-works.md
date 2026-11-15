@@ -10,6 +10,7 @@
 * If whoever opened the channel leaves, the channel closes.
 * In the desktop app, a single Transmitir button starts everything. Outside a channel it opens one, streams as soon as it joins and copies the invite once on air. Inside a channel, including someone else's, it streams there and copies the invite. If the capture is cancelled or fails in a channel opened this way, the app leaves it, so no empty channel stays behind. Quality can be set before streaming; it goes along with the start command.
 * The desktop app goes back to one server. A build made for a server (`TELINHA_SERVER`) always uses that one: a link to another server works for that visit and is not remembered. A public build has no server of its own and remembers the last invite link it joined through.
+* The page runs scripts only from the site itself: PeerJS 1.5.5 is `peerjs.min.js` (MIT, `peerjs.LICENSE.txt`), unchanged from the published package. The server tells browsers so with a Content-Security-Policy, which also keeps the site out of frames and limits connections to this server and the public PeerJS one.
 
 ## Delay
 
