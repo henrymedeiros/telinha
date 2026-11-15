@@ -149,6 +149,10 @@ pub struct Control {
     pub stats: Mutex<Stats>,
     pub gop: Mutex<Gop>,
     pub timings: Mutex<Timings>,
+    /// Tests only: how many frames the encoder refuses next, like a driver
+    /// that opened fine and then would not encode.
+    #[cfg(test)]
+    pub reject_frames: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1170,6 +1174,50 @@ mod tests {
         // The stop request is seen with no frame to wake the loop.
         control.stop.store(true, Ordering::Relaxed);
         assert!(espera(&dropped, 1000), "the video thread did not stop");
+    }
+
+    #[test]
+    fn codificador_que_falha_no_primeiro_quadro_da_lugar_ao_proximo() {
+        // The first image only comes after 200 ms, so the refusal below is in place before it.
+        let (janela, _dropped) = Janela::new(vec![(200, (320, 240)), (230, (320, 240))], None);
+        let (tx, mut rx) = broadcast::channel(256);
+        let control = start(Source::Cpu(Box::new(janela)), qualidade(), tx);
+        control.reject_frames.store(1, Ordering::Relaxed);
+        match saida(&control, &mut rx, 1500) {
+            // Another encoder took over: frames come out, starting from a keyframe.
+            Some(out) => {
+                assert!(out.iter().any(|f| f.key), "no keyframe from the encoder that took over");
+                assert!(control.stats().encoder.is_some());
+            }
+            // No second encoder on this machine (or none at all): the stream
+            // ends with an error, and was never announced as running.
+            None => assert!(control.stats().encoder.is_none(), "announced an encoder that never produced a frame"),
+        }
+        control.stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn so_anuncia_o_codificador_depois_do_primeiro_quadro() {
+        let (janela, _dropped) = Janela::new(vec![(0, (320, 240)), (30, (320, 240))], None);
+        let (tx, _rx) = broadcast::channel(256);
+        let control = start(Source::Cpu(Box::new(janela)), qualidade(), tx);
+        let until = Instant::now() + Duration::from_millis(1500);
+        let mut announced = false;
+        while Instant::now() < until && !announced {
+            // One snapshot: both values from the same moment.
+            let st = control.stats();
+            if st.error.is_some() {
+                eprintln!("no encoder here, skipping");
+                return;
+            }
+            if st.encoder.is_some() {
+                assert!(st.encoded >= 1, "on air before any frame was encoded");
+                announced = true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(announced, "the encoder was never announced");
+        control.stop.store(true, Ordering::Relaxed);
     }
 
     #[test]

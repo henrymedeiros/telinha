@@ -172,6 +172,10 @@ fn encode_loop(shared: &Shared, control: &Control, out: &broadcast::Sender<Arc<E
 }
 
 fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, out: &broadcast::Sender<Arc<EncodedFrame>>) -> ffi::Result<()> {
+    #[cfg(test)]
+    if control.reject_frames.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok() {
+        return Err(ffi::Error("teste: quadro recusado".into()));
+    }
     let Job { mut frame, captured, converted, size, codec } = job;
     let mut o = shared.out.lock().unwrap();
     let key = control.force_key.swap(false, Ordering::Relaxed);
