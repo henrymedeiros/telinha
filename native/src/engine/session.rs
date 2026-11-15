@@ -289,8 +289,10 @@ struct Session {
     demoted: std::collections::HashSet<String>,
     /// Who gets the RTP video through the relay (keeps the bitrate at RELAY_BITRATE): data channel viewers who reported it and were moved to RTP, and RTP viewers whose selected path is the relay (see `note_path`).
     relayed: std::collections::HashSet<String>,
-    /// Who said they decode HEVC but could not: H.264 for the rest of the stream.
-    no_hevc: std::collections::HashSet<String>,
+    /// Who said they decode a codec but could not: they count as not having it for the rest of the session.
+    refused: std::collections::HashSet<(String, video::Codec)>,
+    /// Codecs this machine's encoders could not produce (see `on_tick`): not asked for again.
+    cannot_encode: std::collections::HashSet<video::Codec>,
     /// Who was in the channel at the last roster (for the join and leave
     /// chimes). None until the first roster: that one is not news.
     heard: Option<std::collections::HashSet<String>>,
@@ -404,7 +406,8 @@ async fn start(ui: &mpsc::Sender<Event>, name: String, server: Option<String>, c
         inputs: None,
         demoted: Default::default(),
         relayed: Default::default(),
-        no_hevc: Default::default(),
+        refused: Default::default(),
+        cannot_encode: Default::default(),
         heard: None,
         input: None,
         target: CaptureTarget::Default,
@@ -975,10 +978,11 @@ impl Session {
             }
             (Kind::Turbo, "unsupported") => {
                 let peer = self.conns.get(&conn).map(|c| c.peer.clone()).unwrap_or_default();
-                if self.live.as_ref().is_some_and(|l| l.codec == video::Codec::Hevc) && self.no_hevc.insert(peer.clone()) {
-                    // It claimed HEVC and could not: back to H.264 on the data
+                let codec = self.live.as_ref().map(|l| l.codec);
+                if let Some(c) = codec.filter(|c| *c != video::Codec::H264 && self.refused.insert((peer.clone(), *c))) {
+                    // It claimed it and could not: back to H.264 on the data
                     // channel (a fresh connection; its decoder gave up on this one).
-                    tracing::info!(peer, "viewer could not decode HEVC");
+                    tracing::info!(peer, codec = ?c, "viewer could not decode this codec");
                     self.close_conn(&conn).await;
                     self.sync_viewers().await;
                 } else {
@@ -1349,9 +1353,10 @@ impl Session {
             .members
             .iter()
             .filter(|m| m.id != self.me)
-            .map(|m| (m.wc && !self.demoted.contains(&m.id), m.dec.iter().filter_map(|d| video::Codec::from_name(d)).filter(|c| *c != video::Codec::Hevc || !self.no_hevc.contains(&m.id)).collect()))
+            .map(|m| (m.wc && !self.demoted.contains(&m.id), m.dec.iter().filter_map(|d| video::Codec::from_name(d)).filter(|c| !self.refused.contains(&(m.id.clone(), *c))).collect()))
             .collect();
-        let wanted = pick_codec(&extra_codecs(std::env::var_os("TELINHA_HEVC").is_some(), std::env::var_os("TELINHA_AV1").is_some()), &viewers, rtp);
+        let allowed: Vec<video::Codec> = extra_codecs(std::env::var_os("TELINHA_HEVC").is_some(), std::env::var_os("TELINHA_AV1").is_some()).into_iter().filter(|c| !self.cannot_encode.contains(c)).collect();
+        let wanted = pick_codec(&allowed, &viewers, rtp);
         let Some(live) = &mut self.live else { return };
         if wanted != live.codec {
             tracing::info!(from = ?live.codec, to = ?wanted, "switching codec for the viewers in the channel");
