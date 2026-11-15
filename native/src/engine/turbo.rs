@@ -75,8 +75,15 @@ pub fn packets(seq: u32, frame: &EncodedFrame, ts_us: f64, parity: bool) -> Vec<
 pub struct Counters {
     pub frames: AtomicU64,
     pub bytes: AtomicU64,
-    /// Frames this viewer did not get: queue full, or waiting for a keyframe.
+    /// Frames this viewer did not get, in all: the three below added up.
     pub dropped: AtomicU64,
+    /// Of those: the sender fell behind the encoder's output and frames were overwritten.
+    pub lagged: AtomicU64,
+    /// Of those: the send queue was over its allowance when the frame came.
+    pub full: AtomicU64,
+    /// Of those: skipped while waiting for the keyframe that follows either of the above
+    /// (nothing new can be shown before it, so these say how long the freeze lasted, not how bad the network is).
+    pub waiting: AtomicU64,
 }
 
 /// Rate-limits one viewer's keyframe requests. Each viewer has its own, so
@@ -220,6 +227,7 @@ pub fn spawn(
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     // Fell behind: frames were lost, a keyframe is needed.
                     c.dropped.fetch_add(n, Ordering::Relaxed);
+                    c.lagged.fetch_add(n, Ordering::Relaxed);
                     need_key = true;
                     continue;
                 }
@@ -234,6 +242,7 @@ pub fn spawn(
             if need_key && !frame.key {
                 // Not delivered either: the viewer's picture is frozen meanwhile.
                 c.dropped.fetch_add(1, Ordering::Relaxed);
+                c.waiting.fetch_add(1, Ordering::Relaxed);
                 // Only request the keyframe once the queue drained, otherwise it won't fit either.
                 if queued < budget / 2 {
                     keys.request(&control, Duration::from_secs(1));
@@ -243,6 +252,7 @@ pub fn spawn(
             if queued > budget {
                 need_key = true;
                 c.dropped.fetch_add(1, Ordering::Relaxed);
+                c.full.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let ts = frame.captured.saturating_duration_since(epoch).as_micros() as f64;

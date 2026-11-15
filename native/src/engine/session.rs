@@ -105,9 +105,12 @@ struct Health {
 /// One data channel viewer's totals, for the log: where a stream froze, and why.
 #[derive(Default, Clone, Copy)]
 struct Seen {
-    /// Frames sent and frames the sender dropped (its queue was full).
+    /// The sender's side: frames sent, frames dropped, and why.
     sent: u64,
     dropped: u64,
+    lagged: u64,
+    full: u64,
+    waiting: u64,
     /// The viewer's side: frames lost on the way, skipped because the decoder
     /// or the screen fell behind, and keyframes asked for.
     lost: u64,
@@ -1399,6 +1402,9 @@ impl Session {
         c.health.seen = Seen {
             sent: counters.frames.load(Ordering::Relaxed),
             dropped,
+            lagged: counters.lagged.load(Ordering::Relaxed),
+            full: counters.full.load(Ordering::Relaxed),
+            waiting: counters.waiting.load(Ordering::Relaxed),
             lost: n("lost"),
             decode_drops: n("decodeDrops"),
             render_drops: n("renderDrops"),
@@ -1418,6 +1424,7 @@ impl Session {
         // fills it again: the picture froze for seconds at a time while the
         // ladder took its 5 s steps down. Go straight to what got through.
         if settled && drops >= FULL_DROPS {
+            tracing::info!(peer = %c.peer, drops, got_kbps = (got as f64 * 8.0 / secs / 1000.0).round() as u64, "this viewer's send queue kept dropping frames: the bitrate follows what got through");
             c.health.room = Some(got as f64 * 8.0 / secs * ROOM_SHARE);
         } else if drops == 0 && lost == 0 {
             c.health.room = c.health.room.map(|r| (r * ROOM_GROWTH).min(1e9));
@@ -1517,6 +1524,9 @@ impl Session {
                     network = c.path.map(Path::as_str),
                     sent = now.sent - then.sent,
                     dropped_here = now.dropped - then.dropped,
+                    behind_encoder = now.lagged - then.lagged,
+                    queue_full = now.full - then.full,
+                    waiting_key = now.waiting - then.waiting,
                     lost = now.lost.saturating_sub(then.lost),
                     decode_drops = now.decode_drops.saturating_sub(then.decode_drops),
                     render_drops = now.render_drops.saturating_sub(then.render_drops),
