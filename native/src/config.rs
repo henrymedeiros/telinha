@@ -60,14 +60,19 @@ impl Quality {
     /// Output size, never upscaling past the screen and keeping the aspect ratio.
     /// A window can be any size at all, so this is also what keeps it within what
     /// the encoders take: even on both sides and between `MIN_OUTPUT` and
-    /// `MAX_OUTPUT`. Only a window too narrow for that loses its proportions.
+    /// `MAX_OUTPUT`. A side past the maximum shrinks both sides by the same
+    /// factor (a 5120×1440 screen goes out at 4096×1152). Only a shape that fits
+    /// neither limit at once loses its proportions: the minimum wins on the
+    /// short side, because under it the encoders refuse to open at all.
     pub fn output_size(&self, native: (u32, u32)) -> (u32, u32) {
         let (w, h) = (native.0.max(1), native.1.max(1));
         let th = (self.resolution.height().map_or(h, |t| t.min(h)) & !1).max(2) as f64;
         let tw = th * w as f64 / h as f64;
         let grow = (MIN_OUTPUT.0 as f64 / tw).max(MIN_OUTPUT.1 as f64 / th).max(1.0);
-        let even = |v: f64| (((v * grow / 2.0).round() as u32) * 2).min(MAX_OUTPUT);
-        (even(tw), even(th))
+        let (gw, gh) = (tw * grow, th * grow);
+        let shrink = (MAX_OUTPUT as f64 / gw).min(MAX_OUTPUT as f64 / gh).min(1.0);
+        let even = |v: f64, min: u32| (((v * shrink / 2.0).round() as u32) * 2).clamp(min, MAX_OUTPUT);
+        (even(gw, MIN_OUTPUT.0), even(gh, MIN_OUTPUT.1))
     }
 
     /// Same formula as the site: ~0.08 bits per pixel (0.1 in Nitidez, where
@@ -181,6 +186,25 @@ mod tests {
     }
 
     #[test]
+    fn tela_maior_que_o_limite_encolhe_dos_dois_lados() {
+        let o = q(Resolution::Original);
+        // Ultrawide and 5K: the picture used to go out squeezed (4096×1440, 4096×2880).
+        assert_eq!(o.output_size((5120, 1440)), (4096, 1152));
+        assert_eq!(o.output_size((5120, 2880)), (4096, 2304));
+        assert_eq!(o.output_size((7680, 2160)), (4096, 1152));
+        // The same on its side.
+        assert_eq!(o.output_size((1440, 5120)), (1152, 4096));
+        // Up to the limit nothing changes.
+        assert_eq!(o.output_size((4096, 2160)), (4096, 2160));
+        assert_eq!(o.output_size((3840, 2160)), (3840, 2160));
+        // A chosen height that already fits is not touched by the limit.
+        assert_eq!(q(Resolution::P720).output_size((5120, 1440)), (2560, 720));
+        assert_eq!(q(Resolution::P1080).output_size((5120, 1440)), (3840, 1080));
+        assert_eq!(q(Resolution::P1440).output_size((5120, 1440)), (4096, 1152));
+        assert_eq!(q(Resolution::P1440).output_size((5120, 2880)), (2560, 1440));
+    }
+
+    #[test]
     fn janela_sai_sempre_par_e_dentro_dos_limites() {
         let o = q(Resolution::Original);
         // Odd sizes round to even.
@@ -191,8 +215,9 @@ mod tests {
         assert_eq!(o.output_size((1, 1)), (160, 160));
         // Nothing divides by zero while a window has no size yet.
         assert_eq!(o.output_size((0, 0)), (160, 160));
-        // Absurd proportions stop at the largest side.
-        assert_eq!(o.output_size((6000, 400)).0, 4096);
+        // Past the largest side both sides shrink together; only when the smallest
+        // side would then fall under the minimum do the proportions give way.
+        assert_eq!(o.output_size((6000, 400)), (4096, 274));
         assert_eq!(o.output_size((3000, 10)), (4096, 90));
         for (w, h) in [(3, 7), (640, 481), (1921, 1081), (5000, 300), (161, 91), (160, 90), (333, 1000), (17, 4000)] {
             for r in [Resolution::Original, Resolution::P720, Resolution::P1080, Resolution::P1440] {
