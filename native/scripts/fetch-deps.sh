@@ -7,7 +7,16 @@
 #   - PipeWire headers (extracted from Ubuntu .debs)
 #   - Zig (builds targeting glibc 2.35), appimagetool and NSIS
 # System requirements: curl, python3, ninja, clang, libdrm (headers), apt-get.
+#
+#   sh scripts/fetch-deps.sh          everything, to build and package
+#   sh scripts/fetch-deps.sh teste    only what `cargo test` needs on Linux:
+#                                     prebuilt FFmpeg, libva, PipeWire headers
 set -eu
+MODE="${1:-}"
+case "$MODE" in
+  ""|teste) ;;
+  *) echo "usage: $0 [teste]"; exit 1 ;;
+esac
 cd "$(dirname "$0")/.."
 D="$PWD/.deps"
 mkdir -p "$D" "$D/debs"
@@ -15,19 +24,28 @@ B=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
 
 # Built with the NVENC that runs on NVIDIA drivers from 2023 onward (BtbN's
 # prebuilt ones need drivers from 2026). Without Docker, the prebuilt ones.
-for T in linux64 win64; do
+# For tests the prebuilt Linux one is enough: same FFmpeg, and no GPU is assumed.
+TARGETS="linux64 win64"
+[ "$MODE" = teste ] && TARGETS=linux64
+for T in $TARGETS; do
   OUT="$D/ffmpeg-$([ $T = win64 ] && echo win || echo linux)"
+  # A copy fetched for tests must not end up in a package.
+  if [ "$MODE" != teste ] && [ -f "$OUT/.test-only" ]; then
+    echo "FFmpeg ($T): replacing the copy fetched for tests"
+    rm -rf "$OUT"
+  fi
   [ -d "$OUT" ] && continue
   echo "FFmpeg ($T)"
-  if command -v docker >/dev/null 2>&1; then
+  if [ "$MODE" != teste ] && command -v docker >/dev/null 2>&1; then
     sh scripts/ffmpeg-nvenc.sh $T
   else
-    echo "warning: no Docker, using the prebuilt BtbN FFmpeg: its NVENC requires a 2026 driver"
+    [ "$MODE" = teste ] || echo "warning: no Docker, using the prebuilt BtbN FFmpeg: its NVENC requires a 2026 driver"
     case $T in
       win64) curl -fsSL -o "$D/win.zip" "$B/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip" && unzip -q "$D/win.zip" -d "$D" && rm "$D/win.zip" ;;
       *) curl -fsSL "$B/ffmpeg-n9.0-latest-linux64-lgpl-shared-9.0.tar.xz" | tar -xJ -C "$D" ;;
     esac
     mv "$D"/ffmpeg-n9.0-latest-$T-lgpl-shared-9.0 "$OUT"
+    if [ "$MODE" = teste ]; then touch "$OUT/.test-only"; fi
   fi
 done
 
@@ -57,6 +75,12 @@ if [ ! -d "$D/sysroot/usr/include/pipewire-0.3" ]; then
   (cd "$D/debs" && apt-get download libpipewire-0.3-dev libspa-0.2-dev)
   for f in "$D"/debs/lib*-dev_*.deb; do dpkg-deb -x "$f" "$D/sysroot"; done
   ln -sf /usr/lib/x86_64-linux-gnu/libpipewire-0.3.so.0 "$D/sysroot/usr/lib/x86_64-linux-gnu/libpipewire-0.3.so"
+fi
+
+# The rest is only for packaging.
+if [ "$MODE" = teste ]; then
+  echo "done (tests only)"
+  exit 0
 fi
 
 if [ ! -x "$D/appimagetool" ]; then
