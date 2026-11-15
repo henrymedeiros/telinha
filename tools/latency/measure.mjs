@@ -588,9 +588,8 @@ async function setup() {
 
   // B: guest, joins by code, shares.
   const sender = await mkPage("Sender", { sender: true });
+  // Typing the fourth digit joins right away (app.js): there is no button to press.
   await sender.type("#code", code);
-  await sender.waitForFunction(() => !document.querySelector("#tune").disabled, { timeout: 5000 });
-  await sender.click("#tune");
   await sender.waitForSelector("#room:not([hidden])", { timeout: 20000 });
   // wait until the sender knows about the viewer (roster arrived), otherwise there is no one to call
   await sender.waitForFunction(() => document.querySelectorAll("#people li").length >= 2, { timeout: 15000 });
