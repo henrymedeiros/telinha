@@ -86,9 +86,9 @@ windows() {
   cat > "$S/LEIA-ME.txt" <<TXT
 Telinha $VERSION (portátil)
 
-Abra telinha.exe. Nada é instalado: as preferências ficam em
-%APPDATA%\\Telinha\\telinha e o registro de erros em
-%LOCALAPPDATA%\\Telinha\\telinha\\data\\telinha.log.
+Abra telinha.exe. Nada é instalado: as preferências e o registro de erros
+ficam em %APPDATA%\\Telinha\\telinha (o registro é data\\telinha.log; o da
+vez anterior fica ao lado, em data\\telinha-anterior.log).
 TXT
   (cd "$S" && rm -f "$ROOT/dist/Telinha-${VERSION}-portatil.zip" && zip -qr "$ROOT/dist/Telinha-${VERSION}-portatil.zip" .)
 
