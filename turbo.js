@@ -125,7 +125,7 @@ class KeyBackoff {
 export function keyWait(lastKeyAt, now) { return Math.max(0, lastKeyAt + KEY_FLOOR_MS - now); }
 
 // Codecs past H.264 this browser decodes in hardware, for the streamer to
-// choose (only the desktop app uses it so far, and only HEVC, behind a flag).
+// choose (the desktop app behind a flag, the site's own sender behind ?enc=).
 // isConfigSupported says "maybe" more than "yes" for hardware: a viewer whose
 // decoder still fails asks for normal WebRTC, as with any other codec.
 // ?dec=hevc claims a list instead (to test the streamer's switch and fallback).
@@ -312,6 +312,10 @@ export class TurboSender {
     this.gop = { frames: [], rest: 0 }; // last keyframe and what came after it
     this.encoder = null;
     this.choice = null;
+    this.extra = enabledCodecs(globalThis.location?.search); // codecs past H.264 this page may send
+    this.family = null;        // the extra codec in use, or null on H.264/VP8
+    this.cannot = new Set();   // extra codecs this browser could not encode
+    this.refused = new Map();  // viewer id -> extra codecs their decoder gave up on
     this.size = null;
     this.dirty = false;
     this.closed = false;
@@ -321,9 +325,12 @@ export class TurboSender {
     this.done = this.#loop();
   }
 
-  addViewer(id, channel, { onCongested } = {}) {
-    const v = { id, channel, seq: 0, needKey: true, frames: 0, bytes: 0, dropped: 0, drops: [], onCongested, last: null, strikes: 0, keys: new KeyBackoff(), lastKey: null };
+  addViewer(id, channel, { onCongested, dec = [] } = {}) {
+    const v = { id, channel, seq: 0, needKey: true, frames: 0, bytes: 0, dropped: 0, drops: [], onCongested, last: null, strikes: 0, keys: new KeyBackoff(), lastKey: null, dec: dec.filter((n) => !this.refused.get(id)?.has(n)) };
     this.viewers.set(id, v);
+    // The codec changes with this viewer: the cached frames are in one they may
+    // not decode, so they are not replayed (with nothing cached, start asks for a keyframe).
+    if (this.#wanted() !== this.family) { this.dirty = true; this.gop = { frames: [], rest: 0 }; }
     const start = () => {
       const { frames, rest } = this.gop;
       if (frames.length && rest <= (this.bitrate / 8) * REPLAY_SECONDS) {
@@ -336,7 +343,27 @@ export class TurboSender {
     else channel.addEventListener("open", start, { once: true });
   }
 
-  removeViewer(id) { this.viewers.delete(id); }
+  removeViewer(id) {
+    this.viewers.delete(id);
+    if (this.#wanted() !== this.family) this.dirty = true; // someone who held the room on H.264 left
+  }
+
+  // The extra codec every viewer decodes right now, if this page may use one.
+  #wanted() {
+    return sharedCodec([...this.viewers.values()].map((v) => v.dec), this.extra.filter((n) => !this.cannot.has(n)));
+  }
+
+  // A viewer's decoder gave up. True when the stream was on an extra codec:
+  // that is noted for the viewer, and the stream goes back to what everyone decodes.
+  refuse(id) {
+    if (!this.family) return false;
+    if (!this.refused.has(id)) this.refused.set(id, new Set());
+    this.refused.get(id).add(this.family);
+    const v = this.viewers.get(id);
+    if (v) v.dec = v.dec.filter((n) => n !== this.family);
+    this.dirty = true;
+    return true;
+  }
 
   // Viewers count what arrived. The channel silently drops anything past its
   // lifetime, so the queue here does not show congestion; the report does.
@@ -440,12 +467,25 @@ export class TurboSender {
   }
 
   async #configure(w, h) {
-    if (!this.choice || this.dirty) this.choice = await pickEncoder(w, h, this.bitrate, this.framerate);
+    if (!this.choice || this.dirty) {
+      // An extra codec the encoder turns down is not asked for again; at most one try each.
+      for (let i = 0; i <= EXTRA_CODECS.length; i++) {
+        const want = this.#wanted();
+        this.choice = await pickEncoder(w, h, this.bitrate, this.framerate, want);
+        if (!want || this.choice?.name === want) break;
+        this.cannot.add(want);
+      }
+    }
     if (!this.choice) throw new Error("nenhum codificador disponível");
+    this.family = this.choice.name ?? null;
     if (!this.encoder || this.encoder.state === "closed") {
       this.encoder = new VideoEncoder({
         output: (chunk) => this.#output(chunk),
-        error: (err) => { console.warn("[turbo] encoder", err); this.encoder = null; },
+        error: (err) => {
+          console.warn("[turbo] encoder", err);
+          this.encoder = null;
+          if (this.family) { this.cannot.add(this.family); this.dirty = true; } // a GPU encoder that took the config and then failed is not chosen again
+        },
       });
     }
     this.encoder.configure(encoderConfig(this.choice, w, h, this.bitrate, this.framerate));
