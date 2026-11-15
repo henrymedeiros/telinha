@@ -15,8 +15,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Only the publish job may write to the repository.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,7 +27,9 @@ jobs:
       run:
         working-directory: native
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The packages are named after native/Cargo.toml and the release after
       # the tag: a tag that says another version would publish mislabeled files.
@@ -44,16 +47,17 @@ jobs:
       - name: System packages
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang llvm libclang-dev libdrm-dev libpipewire-0.3-0t64 python3-venv zip
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-deb,cargo-zigbuild,cargo-xwin
+          tool: cargo-deb@3.8.0,cargo-zigbuild@0.23.4,cargo-xwin@0.23.1
 
       - id: deps
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: native/.deps
           key: deps-${{ hashFiles('native/scripts/fetch-deps.sh', 'native/scripts/ffmpeg-nvenc.sh') }}
@@ -64,7 +68,7 @@ jobs:
       # Saved right away: the Windows FFmpeg takes ~20 minutes and must not be
       # rebuilt just because a later step failed.
       - if: steps.deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: native/.deps
           key: ${{ steps.deps.outputs.cache-primary-key }}
@@ -79,19 +83,35 @@ jobs:
         env:
           TELINHA_SERVER: ""
 
-      - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.AppImage dist/*.deb dist/*-instalador.exe dist/*-portatil.zip --generate-notes
-
-      - name: Keep the packages (manual run)
-        if: "!startsWith(github.ref, 'refs/tags/')"
-        uses: actions/upload-artifact@v4
+      # The publish job takes them from here; on a manual run they stay as a download.
+      - name: Keep the packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: telinha
+          if-no-files-found: error
           path: |
             native/dist/*.AppImage
             native/dist/*.deb
             native/dist/*.exe
             native/dist/*.zip
+
+  # Runs nothing from the repository or from the build: it only uploads what the
+  # build job produced, so the token that can write is never near third-party code.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: telinha
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.AppImage dist/*.deb dist/*-instalador.exe dist/*-portatil.zip --generate-notes
