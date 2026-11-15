@@ -78,4 +78,5 @@ The stream only counts as on air once the video thread has an encoder running, s
 ## Limits
 
 * Each viewer gets their own copy of the video, so the streamer's upload speed limits the group. 4 or 5 people work well.
+* A channel takes up to 12 people. The next one to arrive is told it is full. However many viewers ask, the site's minimum delay mode makes at most two keyframes per second.
 * Phones can watch, but most cannot stream.
