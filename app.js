@@ -490,7 +490,7 @@ function applyRoster(list) {
   }
   state.members = next;
 
-  if (state.localStream) for (const id of next.keys()) if (id !== me && !state.outgoing.has(id)) connectMember(id);
+  for (const id of next.keys()) if (needsStream(id)) connectMember(id);
   for (const [id, s] of state.streams) if (!s.local && next.has(id)) s.name = next.get(id).name;
   renderPeople();
   renderStreams();
@@ -630,6 +630,34 @@ function hiFiAudio(sdp) {
   });
 }
 
+// Pause before opening again a viewer's connection that fell mid-stream; the
+// desktop app waits the same (native/src/engine/session.rs, REOPEN_AFTER).
+const REOPEN_AFTER_MS = 3000;
+// A connection that has not come up by then is given up on and tried again.
+const OPEN_TIMEOUT_MS = 15000;
+let reopenTimer = 0;
+
+/** Someone else still in the channel, while this page streams, with nothing going to them. */
+function needsStream(id) {
+  return !!state.localStream && !!state.peer && id !== state.peer.id && state.members.has(id) && !state.outgoing.has(id);
+}
+
+// A viewer's connection fell while the stream goes on: nothing else would open
+// it again until someone joins or leaves. Opened again after a pause, so a
+// viewer who is leaving is gone from the roster by then, and a network that
+// keeps failing gets one try per pause instead of a loop.
+function reopenLater() {
+  if (!state.localStream || reopenTimer) return;
+  reopenTimer = setTimeout(() => {
+    reopenTimer = 0;
+    for (const id of state.members.keys()) {
+      if (!needsStream(id)) continue;
+      console.warn("[telinha] a viewer's connection fell; opening it again:", state.members.get(id)?.name);
+      connectMember(id);
+    }
+  }, REOPEN_AFTER_MS);
+}
+
 function startTransport() {
   if (useTurbo()) {
     const video = state.localStream.getVideoTracks()[0];
@@ -644,6 +672,8 @@ function stopTransport() {
   state.turboOut?.stop();
   state.turboOut = null;
   state.demoted.clear();
+  clearTimeout(reopenTimer);
+  reopenTimer = 0;
 }
 
 // Peers that can receive via WebCodecs get the minimum-latency path; the rest, WebRTC.
@@ -657,11 +687,12 @@ function turboMember(id) {
   if (!conn) return;
   const channel = openVideoChannel(conn.peerConnection);
   let audio = null;
+  let opening = 0, audioAgain = 0, closed = false;
   const handle = {
     kind: "turbo",
     peerConnection: conn.peerConnection,
     turbo: () => state.turboOut?.viewerStats(id),
-    close() { state.turboOut?.removeViewer(id); audio?.close(); conn.close(); },
+    close() { closed = true; clearTimeout(opening); clearTimeout(audioAgain); state.turboOut?.removeViewer(id); audio?.close(); conn.close(); },
   };
   state.outgoing.set(id, handle);
   state.turboOut.addViewer(id, channel, { onCongested: () => demote(id, true) });
@@ -678,9 +709,25 @@ function turboMember(id) {
   // Tells viewers how this side is doing (capture, encoder, hidden tab), so the
   // bottleneck can be found from the viewer's panel alone.
   let info = 0;
-  conn.on("open", () => {
+  // The sound travels on a call of its own. If it falls while the picture goes
+  // on, it is placed again after the same pause.
+  const openAudio = () => {
+    audioAgain = 0;
     const tracks = state.localStream?.getAudioTracks() ?? [];
-    if (tracks.length) audio = state.peer.call(id, new MediaStream(tracks), { metadata: { name: state.name, audioOnly: true } });
+    if (closed || !tracks.length || !conn.open) return;
+    const call = state.peer.call(id, new MediaStream(tracks), { metadata: { name: state.name, audioOnly: true } });
+    if (!call) return;
+    audio = call;
+    const again = () => {
+      if (closed || audio !== call) return;
+      audio = null;
+      audioAgain = setTimeout(openAudio, REOPEN_AFTER_MS);
+    };
+    call.on("close", again);
+    call.on("error", again);
+  };
+  conn.on("open", () => {
+    clearTimeout(opening); openAudio();
     info = setInterval(() => {
       const t = state.turboOut?.viewerStats(id);
       if (!t || !conn.open) return;
@@ -689,14 +736,24 @@ function turboMember(id) {
     }, 1000);
   });
   const end = () => {
+    closed = true;
     clearInterval(info);
+    clearTimeout(opening);
+    clearTimeout(audioAgain);
     if (state.outgoing.get(id) !== handle) return;
     state.outgoing.delete(id);
     state.turboOut?.removeViewer(id);
     audio?.close();
+    reopenLater();
   };
   conn.on("close", end);
   conn.on("error", end);
+  // Never opened: see callMember.
+  opening = setTimeout(() => {
+    if (state.outgoing.get(id) !== handle || conn.open) return;
+    handle.close();
+    end();
+  }, OPEN_TIMEOUT_MS);
 }
 
 // Queue always full or browser lacks the codec: this person goes back to WebRTC,
@@ -715,9 +772,22 @@ function callMember(id) {
   const call = state.peer.call(id, state.localStream, { metadata: { name: state.name, codec: state.codec } });
   if (!call) return;
   state.outgoing.set(id, call);
-  const end = () => { if (state.outgoing.get(id) === call) state.outgoing.delete(id); };
+  let opening = 0;
+  const end = () => {
+    clearTimeout(opening);
+    if (state.outgoing.get(id) !== call) return;
+    state.outgoing.delete(id);
+    reopenLater();
+  };
   call.on("close", end);
   call.on("error", end);
+  // Never answered (the viewer could not be reached): PeerJS says nothing on the
+  // call and close() is silent for one that never opened, so end() is called here.
+  opening = setTimeout(() => {
+    if (state.outgoing.get(id) !== call || call.peerConnection?.connectionState === "connected") return;
+    call.close();
+    end();
+  }, OPEN_TIMEOUT_MS);
   tuneSender(call.peerConnection);
 }
 

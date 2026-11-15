@@ -5,6 +5,7 @@
 * Whoever opens a channel registers the id `telinha-canal-v1-NNNN` on the signaling server and keeps the list of who is in it.
 * Everyone else connects to that person and receives the list.
 * Whoever streams sends video straight to each viewer. When a direct connection is not possible (CGNAT, strict firewalls), the server's coturn relays it. The video stays encrypted.
+* If a viewer's connection falls while the stream goes on and they are still in the channel, the streamer opens it again after 3 seconds (15 if it never came up), one try at a time. The site and the desktop app both do this.
 * If the server does not answer, the site falls back to the public PeerJS server, without a relay.
 * If whoever opened the channel leaves, the channel closes.
 * In the desktop app, a single Transmitir button starts everything. Outside a channel it opens one, streams as soon as it joins and copies the invite once on air. Inside a channel, including someone else's, it streams there and copies the invite. If the capture is cancelled or fails in a channel opened this way, the app leaves it, so no empty channel stays behind. Quality can be set before streaming; it goes along with the start command.
