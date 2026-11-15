@@ -167,6 +167,9 @@ struct Live {
     quality: Quality,
     /// Current bitrate (adaptation lowers it when someone receives poorly).
     bitrate: Arc<AtomicU32>,
+    /// The stream's frame rate, shared with the data channel senders: their
+    /// send queue is sized in frames, so it has to follow a change of quality.
+    fps: Arc<AtomicU32>,
     epoch: Instant,
     last_captured: u64,
     last_tick: Instant,
@@ -878,7 +881,7 @@ impl Session {
             (Kind::Turbo, Which::Video) => {
                 // Video channel open: start sending from a keyframe.
                 if let (Some(live), Some(video)) = (&self.live, c.video.clone()) {
-                    c.sender = Some(turbo::spawn(video, live.frames.subscribe(), live.control.clone(), live.bitrate.clone(), live.quality.fps, live.epoch));
+                    c.sender = Some(turbo::spawn(video, live.frames.subscribe(), live.control.clone(), live.bitrate.clone(), live.fps.clone(), live.epoch));
                 }
             }
             (Kind::Turbo, Which::Control) => c.open = true,
@@ -1050,6 +1053,7 @@ impl Session {
                 self.quality = quality;
                 if let Some(live) = &mut self.live {
                     live.quality = quality;
+                    live.fps.store(quality.fps, Ordering::Relaxed);
                 }
                 if audio_changed && self.live.is_some() {
                     self.switch_audio().await;
@@ -1155,6 +1159,7 @@ impl Session {
             frames,
             quality: self.quality,
             bitrate: Arc::new(AtomicU32::new(bitrate)),
+            fps: Arc::new(AtomicU32::new(self.quality.fps)),
             epoch: Instant::now(),
             last_captured: 0,
             log_at: (Instant::now(), 0, 0),

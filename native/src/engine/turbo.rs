@@ -175,7 +175,7 @@ pub fn spawn(
     mut frames: broadcast::Receiver<Arc<EncodedFrame>>,
     control: Arc<Control>,
     bitrate: Arc<AtomicU32>,
-    fps: u32,
+    fps: Arc<AtomicU32>,
     epoch: Instant,
 ) -> Sender {
     let counters = Arc::new(Counters::default());
@@ -229,7 +229,7 @@ pub fn spawn(
             if frame.index <= replayed {
                 continue; // already sent from the cache
             }
-            let budget = budget(bitrate.load(Ordering::Relaxed), fps, last_key, Instant::now());
+            let budget = budget(bitrate.load(Ordering::Relaxed), fps.load(Ordering::Relaxed), last_key, Instant::now());
             let queued = channel.outstanding_bytes().await.unwrap_or(0);
             if need_key && !frame.key {
                 // Not delivered either: the viewer's picture is frozen meanwhile.
@@ -353,6 +353,15 @@ mod tests {
             let all: Vec<u8> = ps.iter().flat_map(|p| (p.len() as u32).to_le_bytes().into_iter().chain(p.iter().copied())).collect();
             std::fs::write(path, all).unwrap();
         }
+    }
+
+    #[test]
+    fn fila_segue_a_taxa_de_quadros() {
+        let now = Instant::now();
+        // The same bitrate at half the frame rate is frames twice as large:
+        // three of them need twice the room.
+        assert_eq!(budget(11_059_200, 60, None, now), 69_120);
+        assert_eq!(budget(11_059_200, 30, None, now), 138_240);
     }
 
     #[test]
