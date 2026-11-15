@@ -4,7 +4,9 @@ import crypto from "node:crypto";
 import express from "express";
 import { ExpressPeerServer } from "peer";
 
-const PORT = 9000;
+const PORT = Number(process.env.PORT ?? 9000);
+// Where the site's files are; the containers mount them at the default.
+const PUBLIC_DIR = process.env.PUBLIC_DIR ?? "/srv/public";
 const SECRET = process.env.TURN_SECRET;
 const TURN_HOST = process.env.TURN_HOST;
 const CRED_TTL = 24 * 3600;
@@ -24,6 +26,27 @@ app.use((req, res, next) => {
   const origin = req.get("Origin");
   if (origin === SITE || LOCAL.test(origin ?? "")) res.set("Access-Control-Allow-Origin", origin);
   res.set("Vary", "Origin");
+  next();
+});
+// What the page may load and where it may connect. Scripts only from this
+// site (PeerJS is served here too). Styles also inline (the download page's
+// own block) and from Google Fonts, with its font files. Pictures only from
+// here or drawn in the page (data:). Connections to this server and to the
+// public PeerJS server the page falls back to. Nobody may frame the site.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  `connect-src 'self' wss://${TURN_HOST} https://0.peerjs.com wss://0.peerjs.com`,
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+app.use((req, res, next) => {
+  res.set({ "Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY" });
   next();
 });
 
@@ -51,6 +74,6 @@ app.get("/api/ice", (req, res) => {
 
 const server = app.listen(PORT, () => console.log(`telinha on port ${PORT}`));
 app.use("/peer", ExpressPeerServer(server, { path: "/", proxied: true, alive_timeout: 60000 }));
-app.use(express.static("/srv/public", {
+app.use(express.static(PUBLIC_DIR, {
   setHeaders: (res) => res.set("Cache-Control", "no-cache"),
 }));
