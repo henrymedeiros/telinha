@@ -727,14 +727,19 @@ function turboMember(id) {
     close() { closed = true; clearTimeout(opening); clearTimeout(audioAgain); state.turboOut?.removeViewer(id); audio?.close(); conn.close(); },
   };
   state.outgoing.set(id, handle);
-  state.turboOut.addViewer(id, channel, { onCongested: () => demote(id, true) });
+  state.turboOut.addViewer(id, channel, { onCongested: () => demote(id, true), dec: state.members.get(id)?.dec ?? [] });
   conn.on("data", (msg) => {
     if (msg?.t === "key") state.turboOut?.requestKey(500, id);
     else if (msg?.t === "rx") {
       if (msg.relay) demote(id);
       else state.turboOut?.report(id, msg);
     }
-    else if (msg?.t === "unsupported") demote(id);
+    else if (msg?.t === "unsupported") {
+      // Their decoder refused HEVC or AV1: the same path again, now on what
+      // everyone decodes (a fresh connection, as their decoder gave up on this one).
+      if (state.turboOut?.refuse(id)) { handle.close(); state.outgoing.delete(id); turboMember(id); }
+      else demote(id);
+    }
     // The viewer's clock: when this side answered, on its wall and frame clocks.
     else if (msg?.t === "ping") conn.send({ t: "pong", a: msg.a, b: Date.now(), s: state.turboOut?.frameClock() });
   });
