@@ -1,7 +1,6 @@
 // Telinha server on the VPS: static site, PeerJS signaling at /peer
 // and temporary coturn credentials at /api/ice.
 import crypto from "node:crypto";
-import http from "node:http";
 import express from "express";
 import { ExpressPeerServer } from "peer";
 
@@ -49,22 +48,6 @@ app.get("/api/ice", (req, res) => {
     ],
   });
 });
-
-// Discord bot (bot/), wherever it runs: BOT_URL in .env is its address as seen
-// from this container (e.g. http://bot:8790); without it, /discord does not exist.
-// The body passes through untouched: the bot verifies Discord's signature over the bytes.
-const BOT_URL = process.env.BOT_URL;
-if (BOT_URL) {
-  const bot = new URL(BOT_URL);
-  app.use("/discord", (req, res) => {
-    const up = http.request(
-      { host: bot.hostname, port: bot.port, method: req.method, path: req.originalUrl, headers: { ...req.headers, host: bot.host } },
-      (r) => { res.writeHead(r.statusCode ?? 502, r.headers); r.pipe(res); },
-    );
-    up.on("error", () => { if (!res.headersSent) res.status(502).json({ erro: "o bot do Discord está fora do ar" }); });
-    req.pipe(up);
-  });
-}
 
 const server = app.listen(PORT, () => console.log(`telinha on port ${PORT}`));
 app.use("/peer", ExpressPeerServer(server, { path: "/", proxied: true, alive_timeout: 60000 }));

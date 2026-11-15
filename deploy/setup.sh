@@ -29,18 +29,6 @@ else
     echo "TURN_TLS=off"
     echo "COMPOSE_FILE=docker-compose.simple.yml"
   } > .env
-  case "$(ask "Set up the Discord bot now? (y/N):")" in
-    y|Y|yes|s|S|sim)
-      {
-        echo "COMPOSE_PROFILES=discord"
-        echo "BOT_URL=http://bot:8790"
-        echo "DISCORD_CLIENT_ID=$(ask "Application ID:")"
-        echo "DISCORD_PUBLIC_KEY=$(ask "Public Key:")"
-        echo "DISCORD_TOKEN=$(ask "Bot Token:")"
-        echo "DISCORD_CLIENT_SECRET=$(ask "Client Secret:")"
-      } >> .env
-      ;;
-  esac
   chmod 600 .env
 fi
 . ./.env
@@ -78,11 +66,3 @@ docker compose up -d --build --remove-orphans
 
 echo
 echo "Done! Open https://$TURN_HOST"
-if [ "${COMPOSE_PROFILES:-}" = discord ]; then
-  echo
-  echo "Discord bot: in the Developer Portal, paste these values."
-  echo "  General Information > Interactions Endpoint URL:  https://$TURN_HOST/discord/interacoes"
-  echo "  OAuth2 > Redirects:                              https://$TURN_HOST/discord/login/volta"
-  echo "Then add the bot to your Discord server with this link:"
-  echo "  https://discord.com/oauth2/authorize?client_id=$DISCORD_CLIENT_ID&scope=bot+applications.commands&permissions=3072"
-fi

@@ -6,7 +6,6 @@ native/target/
 native/.deps/
 native/dist/
 native/.env.build
-bot/dados.json
 
 # Secrets and keys
 .env
