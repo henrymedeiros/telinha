@@ -1,0 +1,58 @@
+# Runs the desktop app's tests and checks that the site's JavaScript parses,
+# on every push and pull request. The release workflow runs the same tests
+# before it packages.
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  site:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: JavaScript parses
+        run: for f in app.js turbo.js stats.js deploy/server.js; do node --check "$f"; done
+
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: native
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang llvm libclang-dev libdrm-dev libpipewire-0.3-0t64 python3-venv
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A key of its own: this .deps has only what the tests need (a prebuilt
+      # FFmpeg, no Windows one, no packaging tools) and the release workflow
+      # must never restore it.
+      - uses: actions/cache@v4
+        with:
+          path: native/.deps
+          key: test-deps-${{ hashFiles('native/scripts/fetch-deps.sh') }}
+
+      - name: Dependencies (FFmpeg, libva, PipeWire headers)
+        run: sh scripts/fetch-deps.sh teste
+
+      - name: Tests
+        run: LD_LIBRARY_PATH=$PWD/.deps/libva/lib:$PWD/.deps/ffmpeg-linux/lib cargo test --locked
