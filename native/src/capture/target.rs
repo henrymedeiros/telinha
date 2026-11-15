@@ -6,6 +6,7 @@
 // Most of this only runs on Windows, and is kept here to be testable anywhere.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// The DXGI output `ddagrab` opens: its `output_idx` counts the outputs of one
@@ -141,10 +142,53 @@ pub fn real_pid(pid: u32, exe: &str, child_pids: &[u32]) -> Option<u32> {
     child_pids.iter().copied().find(|c| *c != pid && *c != 0)
 }
 
+/// Name fragments of Discord and its alternative clients. The one list: the
+/// window picker, the Linux capture and the Windows capture all go by it.
+pub const DISCORD_CLIENTS: [&str; 7] = ["discord", "vesktop", "vencord", "webcord", "armcord", "legcord", "equibop"];
+
 /// Discord's executables, on both systems' spelling of the name.
 pub fn is_discord(name: &str) -> bool {
     let name = name.to_lowercase();
-    ["discord", "vesktop", "vencord", "webcord", "armcord", "legcord", "equibop"].iter().any(|d| name.contains(d))
+    DISCORD_CLIENTS.iter().any(|d| name.contains(d))
+}
+
+/// Executable names (lowercase, without ".exe") that are a client's own
+/// program: the official builds, and each alternative client under its own
+/// name. Helpers (overlay, updater) carry longer names and are not where the
+/// call plays.
+const DISCORD_MAIN: [&str; 10] = ["discord", "discordptb", "discordcanary", "discorddevelopment", "vesktop", "vencord", "webcord", "armcord", "legcord", "equibop"];
+
+/// The process whose tree plays the call (Windows): among the running
+/// programs of a Discord client, the one that is the ancestor of the most of
+/// that family's processes. `procs` is every process on the system as (PID,
+/// parent's PID, executable name). Only one tree can be left out of the
+/// capture and the answer is asked again every few seconds, so equal counts
+/// go to the lowest PID: the same processes always give the same answer.
+pub fn discord_root(procs: &[(u32, Option<u32>, String)]) -> Option<u32> {
+    let parent: HashMap<u32, Option<u32>> = procs.iter().map(|(pid, parent, _)| (*pid, *parent)).collect();
+    let family: Vec<(u32, String)> = procs.iter().map(|(pid, _, name)| (*pid, name.to_lowercase())).filter(|(_, name)| name.ends_with(".exe") && is_discord(name)).collect();
+    let descendants = |root: u32| {
+        family
+            .iter()
+            .filter(|(pid, _)| {
+                // Walks up the parents (bounded, in case of a loop).
+                let mut cur = parent.get(pid).copied().flatten();
+                for _ in 0..16 {
+                    match cur {
+                        Some(p) if p == root => return true,
+                        Some(p) => cur = parent.get(&p).copied().flatten(),
+                        None => return false,
+                    }
+                }
+                false
+            })
+            .count()
+    };
+    family
+        .iter()
+        .filter(|(_, name)| DISCORD_MAIN.contains(&name.trim_end_matches(".exe")))
+        .max_by_key(|(pid, _)| (descendants(*pid), std::cmp::Reverse(*pid)))
+        .map(|(pid, _)| *pid)
 }
 
 pub fn window_sound(pid: Option<u32>, exe: &str, child_pids: &[u32]) -> WindowSound {
@@ -272,8 +316,37 @@ mod tests {
     fn som_da_janela() {
         assert_eq!(window_sound(Some(7), "spotify.exe", &[]), WindowSound::Process(7));
         assert_eq!(window_sound(Some(7), "Discord.exe", &[]), WindowSound::Discord);
+        assert_eq!(window_sound(Some(7), "Vesktop.exe", &[]), WindowSound::Discord);
         assert_eq!(window_sound(None, "spotify.exe", &[]), WindowSound::Unknown);
         assert_eq!(window_sound(Some(7), "ApplicationFrameHost.exe", &[7]), WindowSound::Unknown);
+    }
+
+    #[test]
+    fn processo_do_discord_a_deixar_de_fora() {
+        let p = |pid: u32, parent: u32, name: &str| (pid, Some(parent), name.to_owned());
+        let others = [p(4, 1, "explorer.exe"), p(50, 4, "firefox.exe")];
+        let with = |extra: &[(u32, Option<u32>, String)]| discord_root(&[&others[..], extra].concat());
+        // Nothing of Discord's is running.
+        assert_eq!(with(&[]), None);
+        // The official client: the program, not one of its children.
+        let discord = [p(100, 4, "Discord.exe"), p(101, 100, "Discord.exe"), p(102, 100, "Discord.exe"), p(103, 101, "Discord.exe")];
+        assert_eq!(with(&discord), Some(100));
+        // An alternative client alone used to be missed.
+        let vesktop = [p(200, 4, "Vesktop.exe"), p(201, 200, "vesktop.exe"), p(202, 200, "vesktop.exe")];
+        assert_eq!(with(&vesktop), Some(200));
+        // Two clients open: the larger tree, whatever the order they are listed in.
+        assert_eq!(with(&[&discord[..], &vesktop[..]].concat()), Some(100));
+        assert_eq!(with(&[&vesktop[..], &discord[..]].concat()), Some(100));
+        // Equal trees: the lowest PID, so the answer does not flip between looks.
+        let legcord = [p(300, 4, "legcord.exe"), p(301, 300, "legcord.exe"), p(302, 300, "legcord.exe")];
+        assert_eq!(with(&[&legcord[..], &vesktop[..]].concat()), Some(200));
+        assert_eq!(with(&[&vesktop[..], &legcord[..]].concat()), Some(200));
+        // A helper on its own is not the program.
+        assert_eq!(with(&[p(400, 4, "DiscordHookHelper64.exe")]), None);
+        // The Linux spelling (no ".exe") is not a Windows process.
+        assert_eq!(with(&[p(500, 4, "vesktop")]), None);
+        // Parents that point at each other do not hang it.
+        assert_eq!(discord_root(&[(1, Some(2), "discord.exe".to_owned()), (2, Some(1), "discord.exe".to_owned())]), Some(1));
     }
 
     #[test]
