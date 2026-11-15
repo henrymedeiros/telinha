@@ -701,14 +701,14 @@ impl Session {
             Signal::Gone { peer } => {
                 if let Role::Guest { host, .. } = &self.role {
                     if *host == peer {
-                        let msg = if self.joined { "O canal saiu do ar.".into() } else { format!("O canal {} não está no ar. Confira o número com quem te convidou.", self.code) };
+                        let msg = host_gone_text(self.joined, &self.code);
                         let _ = self.ui.send(Event::Failed(msg)).await;
                         return Err(());
                     }
                 }
                 let gone: Vec<String> = self.conns.iter().filter(|(_, c)| c.peer == peer).map(|(k, _)| k.clone()).collect();
                 for id in gone {
-                    self.on_conn_closed(&id).await;
+                    self.on_conn_closed(&id).await?;
                 }
             }
             Signal::Error(e) => tracing::warn!("server: {e}"),
@@ -784,11 +784,11 @@ impl Session {
                 }
             }
             PeerEvent::Message { .. } => {}
-            PeerEvent::Closed { conn, which: Which::Control } => self.on_conn_closed(&conn).await,
+            PeerEvent::Closed { conn, which: Which::Control } => return self.on_conn_closed(&conn).await,
             PeerEvent::Closed { .. } => {}
             PeerEvent::State { conn, state } => {
                 if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                    self.on_conn_closed(&conn).await;
+                    self.on_conn_closed(&conn).await?;
                 } else if state == RTCPeerConnectionState::Connected {
                     self.note_path(&conn).await;
                     // RTP video connected: start sending from a keyframe.
@@ -846,16 +846,18 @@ impl Session {
         Ok(())
     }
 
-    async fn on_conn_closed(&mut self, conn: &str) {
-        let Some(c) = self.conns.remove(conn) else { return };
+    async fn on_conn_closed(&mut self, conn: &str) -> Result<(), ()> {
+        let Some(c) = self.conns.remove(conn) else { return Ok(()) };
         let _ = c.pc.close().await;
+        if ends_session(c.kind) {
+            // Without a host there is no channel. `run` does the rest: stops the
+            // stream, closes every connection and tells the UI the app left.
+            let _ = self.ui.send(Event::Failed(host_gone_text(self.joined, &self.code))).await;
+            return Err(());
+        }
         match c.kind {
-            Kind::HostLink => {
-                let _ = self.ui.send(Event::Failed("O canal saiu do ar.".into())).await;
-                // Without a host there is no channel: the session ends on the next command.
-                self.members.clear();
-                self.publish_viewers().await;
-            }
+            // Ended the session above.
+            Kind::HostLink => {}
             Kind::Guest => {
                 self.members.retain(|m| m.id != c.peer);
                 self.broadcast_roster().await;
@@ -884,6 +886,7 @@ impl Session {
             }
             Kind::Turbo | Kind::Media => {}
         }
+        Ok(())
     }
 
     fn member_name(&self, id: &str) -> String {
@@ -892,8 +895,7 @@ impl Session {
 
     async fn on_message(&mut self, conn: String, v: Value) -> Result<(), ()> {
         if v["__peerData"]["type"] == "close" {
-            self.on_conn_closed(&conn).await;
-            return Ok(());
+            return self.on_conn_closed(&conn).await;
         }
         let Some(kind) = self.conns.get(&conn).map(|c| c.kind) else { return Ok(()) };
         match (kind, v["t"].as_str().unwrap_or_default()) {
@@ -1626,6 +1628,19 @@ fn is_join(offer: &Value) -> bool {
     offer["type"] == "data" && offer["metadata"]["kind"].is_null()
 }
 
+/// Whether losing this connection ends the session. A guest's link to the
+/// host is the channel itself: without it there is no member list and nobody
+/// to stream to.
+fn ends_session(kind: Kind) -> bool {
+    kind == Kind::HostLink
+}
+
+/// What the person reads when the host is gone: the channel closed, or (before
+/// the join ever completed) it was never there.
+fn host_gone_text(joined: bool, code: &str) -> String {
+    if joined { "O canal saiu do ar.".into() } else { format!("O canal {code} não está no ar. Confira o número com quem te convidou.") }
+}
+
 /// HEVC needs every viewer on the data channel (RTP is H.264 only) with a
 /// browser that reported a hardware HEVC decoder; anyone else, or nobody,
 /// means H.264. `viewers`: (gets the data channel, decodes HEVC) each.
@@ -1654,6 +1669,17 @@ fn rtp_cap(estimates: &[(String, u32)]) -> (Option<u32>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn so_o_elo_com_o_dono_encerra_a_sessao() {
+        assert!(ends_session(Kind::HostLink));
+        for kind in [Kind::Guest, Kind::Turbo, Kind::Media] {
+            assert!(!ends_session(kind));
+        }
+        // Joined and the host left; or the channel was never there.
+        assert_eq!(host_gone_text(true, "4821"), "O canal saiu do ar.");
+        assert_eq!(host_gone_text(false, "4821"), "O canal 4821 não está no ar. Confira o número com quem te convidou.");
+    }
 
     #[test]
     fn so_entrada_no_canal_vira_convidado() {
