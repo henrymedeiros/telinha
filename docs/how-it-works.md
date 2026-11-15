@@ -75,7 +75,7 @@ Things a window does that a monitor does not, and what happens:
 * **It does not fill its buffer on GNOME**, which sends a buffer as big as the monitor and says where the window is on every frame (`SPA_META_VideoCrop`). VAAPI crops on the GPU, with no copy; other paths crop on the CPU. The window's shadow is part of the picture, as black margins.
 * **It closes.** The stream ends with a warning and the channel stays. On Linux nothing reports this by itself: the PipeWire stream just goes idle, so the capture watches for its node going away.
 
-The stream only counts as on air once the video thread has an encoder running, so a capture that fails does not copy an invite first. Turning the sound on or off mid-stream touches only the connections that carry sound: the capture and the video go on, the system's picker does not reappear, and the invite is not copied again.
+The stream only counts as on air once the encoder has produced its first frame, so a capture or an encoder that fails does not copy an invite first. An encoder that opens but fails on its first frames is passed over for the next one on the list; once frames have gone out, an encoder error ends the stream with a message. Turning the sound on or off mid-stream touches only the connections that carry sound: the capture and the video go on, the system's picker does not reappear, and the invite is not copied again.
 
 ## Limits
 
