@@ -439,6 +439,46 @@ fn graph_out(g: &Graph) -> (u32, u32) {
     g.out_size()
 }
 
+/// Encoders that opened but then failed on frames, for the source and codec
+/// they were tried with. While those stay the same, `build` starts after them.
+/// Candidates for every source and codec share one list, so the mark means
+/// nothing for another source or codec: there the search starts over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rejected {
+    kind: SourceKind,
+    codec: Codec,
+    /// The first candidate still worth trying.
+    next: usize,
+}
+
+/// Where `build` starts looking (its `start_at`).
+fn start_at(rejected: Option<Rejected>, kind: SourceKind, codec: Codec) -> usize {
+    rejected.filter(|r| r.kind == kind && r.codec == codec).map_or(0, |r| r.next)
+}
+
+/// A pipeline on trial. An encoder that opens has proven little: some drivers
+/// only refuse when the first frame arrives. Until a packet has come out, an
+/// error on a frame means "this encoder does not work here" and the next
+/// candidate gets its turn; after that, an error is a real failure and ends
+/// the stream. The session is told about the encoder (and puts the stream on
+/// air) only once it is proven.
+#[derive(Debug, Clone, Copy)]
+struct Trial {
+    /// `Stats::encoded` when the pipeline was installed.
+    since: u64,
+    announced: bool,
+}
+
+impl Trial {
+    fn new(encoded: u64) -> Self {
+        Self { since: encoded, announced: false }
+    }
+
+    fn proven(&self, encoded: u64) -> bool {
+        encoded > self.since
+    }
+}
+
 fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast::Sender<Arc<EncodedFrame>>) -> ffi::Result<()> {
     let mut origin = Origin::default();
     let (kind, mut cpu) = match source {
@@ -1195,6 +1235,20 @@ mod tests {
         assert_eq!(idle_wait(Some(now + ms(3)), Some(now + ms(40)), now), ms(3));
         // Never past the wait that keeps stop requests seen.
         assert_eq!(idle_wait(None, Some(now + ms(900)), now), IDLE_WAIT);
+    }
+
+    #[test]
+    fn pula_os_recusados_so_para_a_mesma_fonte_e_o_mesmo_codec() {
+        let r = Some(Rejected { kind: SourceKind::Cpu, codec: Codec::H264, next: 3 });
+        assert_eq!(start_at(None, SourceKind::Cpu, Codec::H264), 0);
+        assert_eq!(start_at(r, SourceKind::Cpu, Codec::H264), 3);
+        // Another source or codec has its candidates elsewhere in the list.
+        assert_eq!(start_at(r, SourceKind::Prime, Codec::H264), 0);
+        assert_eq!(start_at(r, SourceKind::Cpu, Codec::Hevc), 0);
+        // On trial until a packet comes out after it was installed.
+        let t = Trial::new(10);
+        assert!(!t.proven(10));
+        assert!(t.proven(11));
     }
 
     #[test]
