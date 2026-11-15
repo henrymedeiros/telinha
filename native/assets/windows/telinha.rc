@@ -1,4 +1,4 @@
-// TELINHA_VERSION (0.5.2) and TELINHA_VERSION_NUMBERS (0,5,2,0) come from build.rs.
+// TELINHA_VERSION (as in 1.2.3) and TELINHA_VERSION_NUMBERS (as in 1,2,3,0) come from build.rs, which reads them from Cargo.toml.
 #define TELINHA_STR2(x) #x
 #define TELINHA_STR(x) TELINHA_STR2(x)
 
