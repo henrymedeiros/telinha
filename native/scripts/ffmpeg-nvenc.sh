@@ -17,17 +17,31 @@ cd "$(dirname "$0")/.."
 D="$PWD/.deps"
 T="${1:?usage: ffmpeg-nvenc.sh linux64|win64}"
 NVENC_SDK=sdk/12.1
+# The commit that branch was at when this was pinned, and BtbN's build scripts
+# at one commit: what runs here was looked at once, not whatever is newest.
+# If BtbN's image moves on and this build breaks, move BUILDS_COMMIT to their
+# current master in a commit that says so.
+NVENC_COMMIT=610325d019ad75248aa6e7abe0f4909d2ac6bc69
+BUILDS_COMMIT=c9fe5114060e507409f7ee07edfd82efaf25d767
 IMAGE=ghcr.io/btbn/ffmpeg-builds/$T-lgpl-shared-9.0:latest
 OUT=$D/ffmpeg-$([ "$T" = win64 ] && echo win || echo linux)
 
-[ -d "$D/FFmpeg-Builds" ] || git clone -q --depth 1 https://github.com/BtbN/FFmpeg-Builds "$D/FFmpeg-Builds"
+if [ "$(git -C "$D/FFmpeg-Builds" rev-parse HEAD 2>/dev/null || true)" != "$BUILDS_COMMIT" ]; then
+  rm -rf "$D/FFmpeg-Builds"
+  git init -q "$D/FFmpeg-Builds"
+  git -C "$D/FFmpeg-Builds" fetch -q --depth 1 https://github.com/BtbN/FFmpeg-Builds "$BUILDS_COMMIT"
+  git -C "$D/FFmpeg-Builds" checkout -q FETCH_HEAD
+fi
 docker pull -q "$IMAGE" >/dev/null
+# The base image only has moving tags, so it cannot be pinned without risking
+# a pin that upstream deletes; what was used is written down instead.
+DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
 docker tag "$IMAGE" btbn-$T-lgpl-shared-9.0:original
 mkdir -p "$D/nvenc-antigo"
 cat > "$D/nvenc-antigo/Dockerfile" <<DOCKER
 FROM btbn-$T-lgpl-shared-9.0:original
 RUN rm -rf /opt/ffbuild/include/ffnvcodec /opt/ffbuild/lib/pkgconfig/ffnvcodec.pc \\
- && git clone --depth 1 --branch $NVENC_SDK https://github.com/FFmpeg/nv-codec-headers /tmp/nv \\
+ && git init -q /tmp/nv && git -C /tmp/nv fetch -q --depth 1 https://github.com/FFmpeg/nv-codec-headers $NVENC_COMMIT && git -C /tmp/nv checkout -q FETCH_HEAD \\
  && make -C /tmp/nv PREFIX=/opt/ffbuild install && rm -rf /tmp/nv
 DOCKER
 # Same name as the original image: BtbN's build.sh uses the local one.
@@ -44,4 +58,5 @@ case "$PKG" in
   *) tar -xJf "$PKG" -C "$OUT.tmp" ;;
 esac
 mv "$OUT".tmp/* "$OUT" && rmdir "$OUT.tmp"
-echo "FFmpeg ready (NVENC $NVENC_SDK) in $OUT"
+printf 'base image: %s\nFFmpeg-Builds: %s\nnv-codec-headers: %s\n' "$DIGEST" "$BUILDS_COMMIT" "$NVENC_COMMIT" > "$OUT/BUILD-INFO"
+echo "FFmpeg ready (NVENC $NVENC_SDK) in $OUT, from $DIGEST"
