@@ -515,7 +515,15 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                 change => {
                     if change == Change::Rebuild {
                         (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin)?;
-                        last_input = None;
+                        // The last image goes into the new pipeline too: a still
+                        // screen then gets its keyframe at the new size without
+                        // waiting for the source to repaint. Not a DMA-BUF one: it
+                        // was wrapped for the old pipeline's frames context, which
+                        // went with it.
+                        if kind == SourceKind::Prime {
+                            last_input = None;
+                        }
+                        repeats.rebuilt();
                     } else {
                         if let Some(encoder) = stage.encoder().as_mut() {
                             settings.bitrate = set_bitrate(&pipe, encoder, native, &settings, next.bitrate)?;
@@ -734,6 +742,13 @@ impl Repeats {
     fn repeated(&mut self, now: Instant) {
         self.push = now;
         self.refine = self.refine.saturating_sub(1);
+    }
+
+    /// The pipeline was rebuilt: its encoder starts from a keyframe it still has
+    /// to sharpen, so the still picture gets the same full-rate repeats as
+    /// after a real change.
+    fn rebuilt(&mut self) {
+        self.refine = REFINE_FRAMES;
     }
 
     /// When the next repeat is due. Only after real silence: during motion a
@@ -1162,6 +1177,9 @@ mod tests {
         assert_eq!(r.next_at(p, false), now - p + KEEPALIVE);
         // A keyframe request does not wait for the keepalive.
         assert!(r.next_at(p, true) <= now);
+        // After a rebuild the still picture is refined again, a period apart.
+        r.rebuilt();
+        assert_eq!(r.next_at(p, false), now);
     }
 
     #[test]
