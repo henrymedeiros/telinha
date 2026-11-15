@@ -87,10 +87,9 @@ struct Health {
     last: Option<(Instant, u64, u64, u64)>,
     /// Consecutive bad reports.
     bad: u32,
-    /// What this viewer's network took while its send queue was full (bits/s
-    /// of video), raised a little on every calm report after that: the bitrate
-    /// stays under it, so it is not pushed back into the same freeze.
-    room: Option<f64>,
+    /// When this viewer's send queue began overflowing report after report
+    /// (see `overflow_step`).
+    overflow_since: Option<Instant>,
     /// When this viewer's first report came.
     since: Option<Instant>,
     /// Fragments the viewer rebuilt from parity, as of its last report.
@@ -203,12 +202,12 @@ struct Ladder {
 }
 
 /// Frames dropped for one viewer in one report (about a second) that count as
-/// its send queue being full: what got through is what its network takes.
+/// its send queue overflowing.
 const FULL_DROPS: u64 = 7;
-/// Share of that the video may use, and how much the limit grows per calm
-/// report (about a second): back above the rate that froze after ~10 s.
-const ROOM_SHARE: f64 = 0.85;
-const ROOM_GROWTH: f64 = 1.02;
+/// How long a viewer's send queue may keep overflowing before that viewer is
+/// moved to RTP. Long enough for a burst to pass (one stall, one keyframe),
+/// short enough that nobody watches a picture that freezes every second.
+const OVERFLOW_FOR: Duration = Duration::from_secs(4);
 /// A new connection's first seconds don't measure the network: the data
 /// channel starts slow and the first keyframe fills its queue anyway (its
 /// drops don't count as congestion yet either).
@@ -1414,20 +1413,22 @@ impl Session {
         let now = (Instant::now(), counters.bytes.load(Ordering::Relaxed), n("bytes"), n("lost"));
         let since = *c.health.since.get_or_insert(now.0);
         let Some(prev) = c.health.last.replace(now) else { return };
-        let secs = now.0.duration_since(prev.0).as_secs_f64().max(0.2);
         let sent = now.1.saturating_sub(prev.1);
         let got = now.2.saturating_sub(prev.2);
         let lost = now.3.saturating_sub(prev.3);
         let settled = now.0.duration_since(since) >= ROOM_GRACE;
         let bad = (sent > 50_000 && got < sent * 8 / 10) || lost >= 2 || (settled && drops >= 3);
-        // A network slower than the bitrate fills the queue, and each keyframe
-        // fills it again: the picture froze for seconds at a time while the
-        // ladder took its 5 s steps down. Go straight to what got through.
-        if settled && drops >= FULL_DROPS {
-            tracing::info!(peer = %c.peer, drops, got_kbps = (got as f64 * 8.0 / secs / 1000.0).round() as u64, "this viewer's send queue kept dropping frames: the bitrate follows what got through");
-            c.health.room = Some(got as f64 * 8.0 / secs * ROOM_SHARE);
-        } else if drops == 0 && lost == 0 {
-            c.health.room = c.health.room.map(|r| (r * ROOM_GROWTH).min(1e9));
+        // A send queue that keeps overflowing says this viewer's path does not
+        // suit the data channel, whatever the reason (a slow link, bursty
+        // Wi-Fi): it gets RTP, which has a jitter buffer and measures the
+        // path itself. The bitrate everyone else gets is not cut on that
+        // evidence: "what got through" was mostly the wait for keyframes.
+        let (overflow_since, leave) = if settled { overflow_step(c.health.overflow_since, now.0, drops) } else { (None, false) };
+        c.health.overflow_since = overflow_since;
+        if leave {
+            tracing::info!(peer = %c.peer, drops, "this viewer's send queue kept overflowing: moving it to RTP");
+            self.demote(conn, "its send queue keeps overflowing").await;
+            return;
         }
         if self.adapt(conn, bad) {
             self.demote(conn, "receiving poorly over the data channel").await;
@@ -1457,13 +1458,8 @@ impl Session {
     /// Returns `true` if the connection is still bad even at the floor.
     fn adapt(&mut self, conn: &str, bad: bool) -> bool {
         let Some(ideal) = self.ceiling() else { return false };
-        // The tightest data channel viewer, next to the RTP viewers' estimates.
-        let room = self.conns.values().filter_map(|c| c.health.room).reduce(f64::min).map(|r| r as u32);
         let Some(live) = &mut self.live else { return false };
-        let cap = match (live.cap, room) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let cap = live.cap;
         let Some(c) = self.conns.get_mut(conn) else { return false };
         c.health.bad = if bad { c.health.bad + 1 } else { 0 };
         let current = live.bitrate.load(Ordering::Relaxed);
@@ -1785,6 +1781,21 @@ fn pick_codec(allowed: &[video::Codec], viewers: &[(bool, Vec<video::Codec>)], r
     allowed.iter().copied().find(|c| viewers.iter().all(|(_, dec)| dec.contains(c))).unwrap_or(video::Codec::H264)
 }
 
+/// One report from a data channel viewer, as far as its send queue goes.
+/// `since` is when its current run of overflowing reports began. Returns the
+/// new `since` and whether the run has lasted long enough to move the viewer
+/// to RTP. A clean report ends the run; a few drops neither start nor end one.
+fn overflow_step(since: Option<Instant>, now: Instant, drops: u64) -> (Option<Instant>, bool) {
+    if drops == 0 {
+        return (None, false);
+    }
+    if drops < FULL_DROPS {
+        return (since, false);
+    }
+    let began = since.unwrap_or(now);
+    (Some(began), now.duration_since(began) >= OVERFLOW_FOR)
+}
+
 /// The codecs past H.264 this run may use, best first: AV1 gives the most
 /// picture per bit, then HEVC. Each is off unless its variable is set: not yet
 /// tried on real viewers.
@@ -1919,6 +1930,24 @@ mod tests {
         assert!(!picture_changed(q, q));
         assert!(picture_changed(q, Quality { fps: 30, ..q }));
         assert!(picture_changed(q, Quality { fps: 30, system_audio: !q.system_audio, ..q }));
+    }
+
+    #[test]
+    fn fila_que_nao_esvazia_tira_o_espectador_do_canal_de_dados() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        // The first overflowing report starts the clock; nothing happens yet.
+        assert_eq!(overflow_step(None, s(0), 9), (Some(s(0)), false));
+        assert_eq!(overflow_step(Some(s(0)), s(3), 40), (Some(s(0)), false));
+        // Four seconds of it: this viewer leaves the data channel.
+        assert_eq!(overflow_step(Some(s(0)), s(4), 7), (Some(s(0)), true));
+        // A clean report ends the run, and the next one starts from scratch.
+        assert_eq!(overflow_step(Some(s(0)), s(2), 0), (None, false));
+        assert_eq!(overflow_step(None, s(3), 7), (Some(s(3)), false));
+        // A few drops are not an overflow, and do not forgive one either.
+        assert_eq!(overflow_step(None, s(1), 6), (None, false));
+        assert_eq!(overflow_step(Some(s(0)), s(1), 3), (Some(s(0)), false));
+        assert_eq!(overflow_step(Some(s(0)), s(5), 3), (Some(s(0)), false));
     }
 
     #[test]
