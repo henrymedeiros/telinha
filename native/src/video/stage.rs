@@ -162,7 +162,12 @@ fn encode_loop(shared: &Shared, control: &Control, out: &broadcast::Sender<Arc<E
         let mut guard = shared.encoder.lock().unwrap();
         let Some(encoder) = guard.as_mut() else { continue };
         let Some(job) = shared.slot.lock().unwrap().take() else { continue };
-        encode(encoder, shared, job, control, out)?;
+        // The error is left for the capture thread, which decides what comes
+        // next: another encoder, or the end of the stream. This thread stays,
+        // because the encoder it is handed next may be a different one.
+        if let Err(e) = encode(encoder, shared, job, control, out) {
+            *shared.failed.lock().unwrap() = Some(e);
+        }
     }
 }
 
