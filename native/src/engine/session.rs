@@ -1345,13 +1345,13 @@ impl Session {
     /// Switches the encoder to the codec the current viewers allow.
     fn follow_codec(&mut self) {
         let rtp = self.conns.values().any(|c| c.kind == Kind::Media && !c.audio_only);
-        let viewers: Vec<(bool, bool)> = self
+        let viewers: Vec<(bool, Vec<video::Codec>)> = self
             .members
             .iter()
             .filter(|m| m.id != self.me)
-            .map(|m| (m.wc && !self.demoted.contains(&m.id), m.dec.iter().any(|d| d == "hevc") && !self.no_hevc.contains(&m.id)))
+            .map(|m| (m.wc && !self.demoted.contains(&m.id), m.dec.iter().filter_map(|d| video::Codec::from_name(d)).filter(|c| *c != video::Codec::Hevc || !self.no_hevc.contains(&m.id)).collect()))
             .collect();
-        let wanted = pick_codec(std::env::var_os("TELINHA_HEVC").is_some(), &viewers, rtp);
+        let wanted = pick_codec(&extra_codecs(std::env::var_os("TELINHA_HEVC").is_some(), std::env::var_os("TELINHA_AV1").is_some()), &viewers, rtp);
         let Some(live) = &mut self.live else { return };
         if wanted != live.codec {
             tracing::info!(from = ?live.codec, to = ?wanted, "switching codec for the viewers in the channel");
@@ -1746,12 +1746,23 @@ fn host_gone_text(joined: bool, code: &str) -> String {
     if joined { "O canal saiu do ar.".into() } else { format!("O canal {code} não está no ar. Confira o número com quem te convidou.") }
 }
 
-/// HEVC needs every viewer on the data channel (RTP is H.264 only) with a
-/// browser that reported a hardware HEVC decoder; anyone else, or nobody,
-/// means H.264. `viewers`: (gets the data channel, decodes HEVC) each.
-/// Off unless TELINHA_HEVC is set: not yet tried on real viewers.
-fn pick_codec(enabled: bool, viewers: &[(bool, bool)], rtp: bool) -> video::Codec {
-    if enabled && !rtp && !viewers.is_empty() && viewers.iter().all(|&(turbo, hevc)| turbo && hevc) { video::Codec::Hevc } else { video::Codec::H264 }
+/// The best codec every viewer can take. Anything past H.264 needs every
+/// viewer on the data channel (RTP is H.264 only) with a browser that reported
+/// a hardware decoder for it; anyone else, or nobody, means H.264.
+/// `allowed`: the codecs past H.264 this run may use, best first.
+/// `viewers`: (gets the data channel, what it decodes) each.
+fn pick_codec(allowed: &[video::Codec], viewers: &[(bool, Vec<video::Codec>)], rtp: bool) -> video::Codec {
+    if rtp || viewers.is_empty() || viewers.iter().any(|(turbo, _)| !turbo) {
+        return video::Codec::H264;
+    }
+    allowed.iter().copied().find(|c| viewers.iter().all(|(_, dec)| dec.contains(c))).unwrap_or(video::Codec::H264)
+}
+
+/// The codecs past H.264 this run may use, best first: AV1 gives the most
+/// picture per bit, then HEVC. Each is off unless its variable is set: not yet
+/// tried on real viewers.
+fn extra_codecs(hevc: bool, av1: bool) -> Vec<video::Codec> {
+    [(av1, video::Codec::Av1), (hevc, video::Codec::Hevc)].into_iter().filter(|(on, _)| *on).map(|(_, c)| c).collect()
 }
 
 /// Whether a connection's path says its viewer gets the video through the
@@ -1923,15 +1934,24 @@ mod tests {
     }
 
     #[test]
-    fn hevc_so_se_todos_decodificam() {
-        use video::Codec::{H264, Hevc};
-        assert_eq!(pick_codec(true, &[(true, true), (true, true)], false), Hevc);
-        // Off by default, nobody watching, someone on RTP, or one without it: H.264.
-        assert_eq!(pick_codec(false, &[(true, true)], false), H264);
-        assert_eq!(pick_codec(true, &[], false), H264);
-        assert_eq!(pick_codec(true, &[(true, true)], true), H264);
-        assert_eq!(pick_codec(true, &[(true, true), (true, false)], false), H264);
-        assert_eq!(pick_codec(true, &[(false, true)], false), H264);
+    fn codec_so_se_todos_decodificam() {
+        use video::Codec::{Av1, H264, Hevc};
+        let v = |list: &[(bool, &[video::Codec])]| list.iter().map(|(t, d)| (*t, d.to_vec())).collect::<Vec<_>>();
+        assert_eq!(pick_codec(&[Hevc], &v(&[(true, &[Hevc]), (true, &[Hevc])]), false), Hevc);
+        // Nothing allowed, nobody watching, someone on RTP, or one without it: H.264.
+        assert_eq!(pick_codec(&[], &v(&[(true, &[Hevc])]), false), H264);
+        assert_eq!(pick_codec(&[Hevc], &v(&[]), false), H264);
+        assert_eq!(pick_codec(&[Hevc], &v(&[(true, &[Hevc])]), true), H264);
+        assert_eq!(pick_codec(&[Hevc], &v(&[(true, &[Hevc]), (true, &[])]), false), H264);
+        assert_eq!(pick_codec(&[Hevc], &v(&[(false, &[Hevc])]), false), H264);
+        // The first allowed codec that everyone decodes wins.
+        assert_eq!(pick_codec(&[Av1, Hevc], &v(&[(true, &[Hevc, Av1])]), false), Av1);
+        assert_eq!(pick_codec(&[Av1, Hevc], &v(&[(true, &[Hevc, Av1]), (true, &[Hevc])]), false), Hevc);
+        assert_eq!(pick_codec(&[Av1, Hevc], &v(&[(true, &[Av1]), (true, &[Hevc])]), false), H264);
+        assert_eq!(pick_codec(&[Hevc], &v(&[(true, &[Av1])]), false), H264);
+        assert_eq!(extra_codecs(false, false), vec![]);
+        assert_eq!(extra_codecs(true, false), vec![Hevc]);
+        assert_eq!(extra_codecs(true, true), vec![Av1, Hevc]);
     }
 
     #[test]
