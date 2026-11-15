@@ -319,6 +319,11 @@ pub async fn run(mut cmds: mpsc::Receiver<Command>, ui: mpsc::Sender<Event>) {
     }
 }
 
+/// Whether two qualities differ in anything the picture depends on (all but the sound).
+fn picture_changed(before: Quality, after: Quality) -> bool {
+    Quality { system_audio: after.system_audio, ..before } != after
+}
+
 /// Accepts "4821", "https://server/#4821" or "server/#4821".
 fn parse_invite(input: &str, server: Option<String>) -> Result<(String, String), String> {
     let input = input.trim();
@@ -1015,6 +1020,7 @@ impl Session {
             }
             Command::SetQuality { quality } => {
                 let audio_changed = quality.system_audio != self.quality.system_audio;
+                let picture = picture_changed(self.quality, quality);
                 self.quality = quality;
                 if let Some(live) = &mut self.live {
                     live.quality = quality;
@@ -1022,9 +1028,13 @@ impl Session {
                 if audio_changed && self.live.is_some() {
                     self.switch_audio().await;
                 }
-                if let (Some(bitrate), Some(live)) = (self.ceiling(), &self.live) {
-                    live.bitrate.store(bitrate, Ordering::Relaxed);
-                    live.control.reconfigure(Settings { quality, bitrate, codec: live.codec });
+                // Sound on or off leaves the picture alone: no new bitrate, no
+                // reopened encoder, no keyframe for everyone.
+                if picture {
+                    if let (Some(bitrate), Some(live)) = (self.ceiling(), &self.live) {
+                        live.bitrate.store(bitrate, Ordering::Relaxed);
+                        live.control.reconfigure(Settings { quality, bitrate, codec: live.codec });
+                    }
                 }
             }
             _ => {}
@@ -1688,6 +1698,15 @@ mod tests {
         assert!(!is_join(&json!({ "type": "data", "metadata": { "kind": "turbo" } })));
         // Would otherwise replace the real member with a nameless one.
         assert!(!is_join(&json!({ "type": "data", "metadata": { "kind": "passe", "passe": "x.y" } })));
+    }
+
+    #[test]
+    fn ligar_o_som_nao_mexe_na_imagem() {
+        let q = Quality::default();
+        assert!(!picture_changed(q, Quality { system_audio: !q.system_audio, ..q }));
+        assert!(!picture_changed(q, q));
+        assert!(picture_changed(q, Quality { fps: 30, ..q }));
+        assert!(picture_changed(q, Quality { fps: 30, system_audio: !q.system_audio, ..q }));
     }
 
     #[test]

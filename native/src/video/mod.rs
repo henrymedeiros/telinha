@@ -159,6 +159,29 @@ pub struct Settings {
     pub codec: Codec,
 }
 
+/// What new `Settings` ask of the pipeline. The encoder only ever sees the
+/// output size, the frame rate, the codec and the bitrate: sound on or off, the
+/// priority, or a resolution that gives this source the same size change
+/// nothing here, and must not cost a reopened encoder and a keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Nothing,
+    Bitrate,
+    Rebuild,
+}
+
+impl Change {
+    fn between(current: &Settings, next: &Settings, native: (u32, u32)) -> Self {
+        if next.quality.output_size(native) != current.quality.output_size(native) || next.quality.fps != current.quality.fps || next.codec != current.codec {
+            Self::Rebuild
+        } else if next.bitrate != current.bitrate {
+            Self::Bitrate
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
 /// What the stream is encoded in. HEVC only goes to minimum delay viewers
 /// whose browsers decode it in hardware (see the session); RTP is H.264.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -486,24 +509,25 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
         // wait for a rebuild.
         let next = control.pending.lock().unwrap().take();
         if let Some(next) = next {
-            if next != settings {
-                let rebuild_all = next.quality.output_size(native) != settings.quality.output_size(native)
-                    || next.quality.fps != settings.quality.fps
-                    || next.codec != settings.codec;
-                if rebuild_all {
-                    (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin)?;
-                    last_input = None;
-                } else {
-                    if let Some(encoder) = stage.encoder().as_mut() {
-                        settings.bitrate = set_bitrate(&pipe, encoder, native, &settings, next.bitrate)?;
+            match Change::between(&settings, &next, native) {
+                // Remembered, so the next comparison is against what was asked last.
+                Change::Nothing => settings.quality = next.quality,
+                change => {
+                    if change == Change::Rebuild {
+                        (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin)?;
+                        last_input = None;
+                    } else {
+                        if let Some(encoder) = stage.encoder().as_mut() {
+                            settings.bitrate = set_bitrate(&pipe, encoder, native, &settings, next.bitrate)?;
+                        }
+                        settings.quality = next.quality;
                     }
-                    settings.quality = next.quality;
+                    pacer = Pacer::new(settings.quality.fps);
+                    // Frames from before the change do not lead into the ones after it.
+                    control.gop.lock().unwrap().clear();
+                    control.request_key();
+                    publish_encoder(control, &pipe, native);
                 }
-                pacer = Pacer::new(settings.quality.fps);
-                // Frames from before the change do not lead into the ones after it.
-                control.gop.lock().unwrap().clear();
-                control.request_key();
-                publish_encoder(control, &pipe, native);
             }
         }
 
@@ -1103,5 +1127,28 @@ mod tests {
         assert_eq!(r.next_at(p, false), now - p + KEEPALIVE);
         // A keyframe request does not wait for the keepalive.
         assert!(r.next_at(p, true) <= now);
+    }
+
+    #[test]
+    fn so_mexe_no_codificador_pelo_que_ele_usa() {
+        use crate::config::{Priority, Resolution};
+        let native = (1920, 1080);
+        let base = Settings { quality: Quality::default(), bitrate: 10_000_000, codec: Codec::H264 };
+        let with = |f: fn(&mut Settings)| {
+            let mut s = base;
+            f(&mut s);
+            Change::between(&base, &s, native)
+        };
+        assert_eq!(with(|_| {}), Change::Nothing);
+        // Sound, priority, and a resolution that gives the same size here.
+        assert_eq!(with(|s| s.quality.system_audio = false), Change::Nothing);
+        assert_eq!(with(|s| s.quality.priority = Priority::Nitidez), Change::Nothing);
+        assert_eq!(with(|s| s.quality.resolution = Resolution::P1440), Change::Nothing);
+        assert_eq!(with(|s| s.bitrate = 8_000_000), Change::Bitrate);
+        assert_eq!(with(|s| s.quality.resolution = Resolution::P720), Change::Rebuild);
+        assert_eq!(with(|s| s.quality.fps = 30), Change::Rebuild);
+        assert_eq!(with(|s| s.codec = Codec::Hevc), Change::Rebuild);
+        // A rebuild carries the new bitrate with it.
+        assert_eq!(with(|s| { s.quality.resolution = Resolution::P720; s.bitrate = 3_000_000; }), Change::Rebuild);
     }
 }
