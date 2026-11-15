@@ -1,0 +1,6 @@
+# All-in-one setup (docker-compose.simple.yml): HTTPS for the domain in TURN_HOST,
+# text compressed on the way out, everything handed to the site's server.
+{$TURN_HOST} {
+	encode zstd gzip
+	reverse_proxy telinha:9000
+}
