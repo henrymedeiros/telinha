@@ -35,8 +35,6 @@ struct Member {
     /// Receives video via WebCodecs (Chrome/Edge; Safari and Firefox paint it
     /// on a canvas). These get the data channel; the rest get RTP.
     wc: bool,
-    /// Avatar URL (see the CDN check where guests join), passed along in the roster.
-    avatar: String,
     /// Codecs past H.264 the browser decodes in hardware ("hevc", "av1").
     dec: Vec<String>,
 }
@@ -403,7 +401,7 @@ async fn start(ui: &mpsc::Sender<Event>, name: String, server: Option<String>, c
 
     if is_host {
         s.heard = Some([me.clone()].into());
-        s.members = vec![Member { id: me, name, sharing: false, wc: false, avatar: String::new(), dec: vec![] }];
+        s.members = vec![Member { id: me, name, sharing: false, wc: false, dec: vec![] }];
         s.joined = true;
         s.announce_joined().await;
     } else {
@@ -829,14 +827,13 @@ impl Session {
                 let wc = c.meta["wc"].as_bool().unwrap_or(false);
                 let id = c.peer.clone();
                 self.members.retain(|m| m.id != id);
-                let avatar = c.meta["avatar"].as_str().filter(|a| a.starts_with("https://cdn.discordapp.com/avatars/")).unwrap_or_default().to_owned();
                 let dec = decoders(&c.meta["dec"]);
                 // Their last page in a channel ended without closing (see app.js).
                 if let Some(how) = c.meta["restart"].as_str().filter(|h| !h.is_empty()) {
                     let why = if how == "hidden" { "the browser dropped it while in the background" } else { "it crashed" };
                     tracing::warn!(who = %name, why, "viewer's previous page ended without closing");
                 }
-                self.members.push(Member { id, name, sharing: false, wc, avatar, dec });
+                self.members.push(Member { id, name, sharing: false, wc, dec });
                 self.broadcast_roster().await;
             }
             (Kind::Turbo, Which::Video) => {
@@ -915,7 +912,6 @@ impl Session {
                                 sharing: m["sharing"].as_bool().unwrap_or(false),
                                 wc: m["wc"].as_bool().unwrap_or(false),
                                 dec: decoders(&m["dec"]),
-                                avatar: m["avatar"].as_str().unwrap_or_default().to_owned(),
                             })
                             .collect()
                     })
@@ -977,7 +973,7 @@ impl Session {
             me.sharing = self.live.is_some();
         }
         let members: Vec<Value> =
-            self.members.iter().map(|m| json!({ "id": m.id, "name": m.name, "avatar": m.avatar, "sharing": m.sharing, "wc": m.wc, "dec": m.dec })).collect();
+            self.members.iter().map(|m| json!({ "id": m.id, "name": m.name, "sharing": m.sharing, "wc": m.wc, "dec": m.dec })).collect();
         let msg = json!({ "t": "roster", "members": members });
         for c in self.conns.values().filter(|c| c.kind == Kind::Guest && c.open) {
             if let Some(ch) = &c.control {
