@@ -251,15 +251,29 @@ async fn headless(link: Option<String>, server: Option<String>, secs: u64) {
     }
 }
 
+const LOG: &str = "telinha.log";
+/// The log of the run before this one.
+const PREVIOUS_LOG: &str = "telinha-anterior.log";
+
+/// Opens a fresh log in `dir` and keeps the last run's next to it. After a crash
+/// the natural next step is to open the app again, and that used to erase the
+/// panic the tester was about to send.
+fn open_log(dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let log = dir.join(LOG);
+    // Failing here (first run, or the old copy still closing after an update)
+    // only costs the previous log, never the start.
+    let _ = std::fs::rename(&log, dir.join(PREVIOUS_LOG));
+    std::fs::File::create(log).ok()
+}
+
 /// Logs to the terminal and to a file (so Windows testers can send it back):
 /// Linux ~/.local/share/telinha/telinha.log, Windows %APPDATA%\\Telinha\\telinha\\data\\telinha.log.
+/// The previous run's log is kept beside it as telinha-anterior.log.
 fn init_logs() {
     use tracing_subscriber::prelude::*;
     let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "telinha=info".into());
-    let file = config::dirs().and_then(|d| {
-        std::fs::create_dir_all(d.data_dir()).ok()?;
-        std::fs::File::create(d.data_dir().join("telinha.log")).ok()
-    });
+    let file = config::dirs().and_then(|d| open_log(d.data_dir()));
     let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter());
     let file = file.map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)).with_filter(filter()));
     tracing_subscriber::registry().with(stderr).with(file).init();
@@ -270,4 +284,46 @@ fn init_logs() {
         default_hook(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, "Telinha started");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A folder of this test's own under the system's temporary one.
+    fn pasta(nome: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("telinha-teste-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn registro_anterior_fica_guardado() {
+        let dir = pasta("registro");
+        // First run: nothing to keep.
+        let mut log = open_log(&dir).expect("log");
+        assert!(!dir.join(PREVIOUS_LOG).exists());
+        writeln!(log, "primeira").unwrap();
+        drop(log);
+        // Second run: the first one's log is kept, the new one starts empty.
+        let mut log = open_log(&dir).expect("log");
+        assert_eq!(std::fs::read_to_string(dir.join(PREVIOUS_LOG)).unwrap(), "primeira\n");
+        assert_eq!(std::fs::read_to_string(dir.join(LOG)).unwrap(), "");
+        writeln!(log, "segunda").unwrap();
+        drop(log);
+        // Third run: only one previous log is kept.
+        drop(open_log(&dir).expect("log"));
+        assert_eq!(std::fs::read_to_string(dir.join(PREVIOUS_LOG)).unwrap(), "segunda\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registro_sem_pasta_nao_impede_o_inicio() {
+        // A folder that cannot be created (its parent is a file): no log, no panic.
+        let dir = pasta("registro-sem-pasta");
+        std::fs::write(&dir, "arquivo").unwrap();
+        assert!(open_log(&dir.join("dentro")).is_none());
+        let _ = std::fs::remove_file(&dir);
+    }
 }
