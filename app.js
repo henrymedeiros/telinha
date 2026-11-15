@@ -491,7 +491,11 @@ function closeIncoming(id) {
 
 function applyRoster(list) {
   const me = state.peer.id;
-  const next = new Map(list.map((m) => [m.id, { name: m.name, sharing: !!m.sharing, wc: !!m.wc, dec: decoderList(m.dec) }]));
+  // The list comes from whoever hosts the channel: anything that is not a
+  // person is dropped, names are cut like a host cuts them, and past
+  // MAX_PEOPLE the rest is ignored (this page stays on it).
+  const people = list.filter((m) => m && typeof m.id === "string" && typeof m.name === "string").filter((m, i) => i < MAX_PEOPLE || m.id === me);
+  const next = new Map(people.map((m) => [m.id, { name: m.name.slice(0, 24), sharing: !!m.sharing, wc: !!m.wc, dec: decoderList(m.dec) }]));
 
   for (const [id, prev] of state.members) {
     if (id === me) continue;
@@ -1471,6 +1475,8 @@ function faceFor(name) {
   if (!faces.has(name)) {
     let face = "";
     try { face = makeFace(name.slice(0, 24)); } catch {}
+    // The oldest drawing goes when there are too many (a Map keeps insertion order).
+    if (faces.size >= MAX_FACES) faces.delete(faces.keys().next().value);
     faces.set(name, face);
   }
   return faces.get(name);
