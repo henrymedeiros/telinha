@@ -212,6 +212,7 @@ fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, o
                 let data = o.hevc.fix_keyframe(pkt.data, pkt.key);
                 (data, o.hevc.codec())
             }
+            Codec::Av1 => (pkt.data, None),
         };
         let Some(codec) = codec else { continue };
         o.index += 1;

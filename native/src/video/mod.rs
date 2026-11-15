@@ -186,19 +186,33 @@ impl Change {
     }
 }
 
-/// What the stream is encoded in. HEVC only goes to minimum delay viewers
-/// whose browsers decode it in hardware (see the session); RTP is H.264.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What the stream is encoded in. HEVC and AV1 only go to minimum delay
+/// viewers whose browsers decode them in hardware (see the session); RTP is H.264.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Codec {
     #[default]
     H264,
     Hevc,
+    Av1,
 }
 
 impl Codec {
-    /// TELINHA_CODEC=hevc picks HEVC from the start (for --teste-video).
+    /// TELINHA_CODEC=hevc or TELINHA_CODEC=av1 picks that codec from the start (for --teste-video).
     pub fn from_env() -> Self {
-        if std::env::var("TELINHA_CODEC").is_ok_and(|v| v.eq_ignore_ascii_case("hevc")) { Self::Hevc } else { Self::H264 }
+        match std::env::var("TELINHA_CODEC") {
+            Ok(v) if v.eq_ignore_ascii_case("hevc") => Self::Hevc,
+            Ok(v) if v.eq_ignore_ascii_case("av1") => Self::Av1,
+            _ => Self::H264,
+        }
+    }
+
+    /// The name viewers use for it in their decoder list (turbo.js, `hardwareDecoders`). H.264 has none: everyone decodes it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "hevc" => Some(Self::Hevc),
+            "av1" => Some(Self::Av1),
+            _ => None,
+        }
     }
 }
 
