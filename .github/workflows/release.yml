@@ -59,6 +59,11 @@ jobs:
           path: native/.deps
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      # A release never goes out with a failing test. The debug build is removed
+      # afterwards: the packaging below needs the disk.
+      - name: Tests
+        run: LD_LIBRARY_PATH=$PWD/.deps/libva/lib:$PWD/.deps/ffmpeg-linux/lib CARGO_PROFILE_DEV_DEBUG=0 cargo test --locked && rm -rf target/debug
+
       - name: Packages
         run: sh scripts/package.sh tudo
         env:
