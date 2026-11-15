@@ -32,6 +32,12 @@ const PACKET_LIFETIME_MS = 150;
 const KEY_INTERVAL_MS = 1000; // keyframe requested due to full queue: at most 1 per second per viewer
 const QUEUE_FRAMES = 3;       // send queue allowed per viewer, in average frames (~50 ms)
 const VIEWER_KEY_MS = 500;    // keyframe requested by a viewer that lost a frame
+// However many viewers ask, the encoder makes at most one keyframe per this
+// long: what a single viewer may already ask for (VIEWER_KEY_MS), so one
+// viewer's behaviour does not change and ten cannot ask for ten times more.
+// A request inside the window is not lost, it waits for the window to end,
+// so someone who just joined still starts within half a second.
+const KEY_FLOOR_MS = 500;
 // Someone who keeps asking for keyframes waits longer the second time (500 ms,
 // then 1 s), back to the start after a few calm seconds: on a link that keeps
 // losing, a keyframe as often as allowed only adds to the loss. Not longer:
@@ -114,6 +120,9 @@ class KeyBackoff {
     return true;
   }
 }
+
+/** How long (ms) a keyframe asked for at `now` waits, given when the last one was made. */
+export function keyWait(lastKeyAt, now) { return Math.max(0, lastKeyAt + KEY_FLOOR_MS - now); }
 
 // Codecs past H.264 this browser decodes in hardware, for the streamer to
 // choose (only the desktop app uses it so far, and only HEVC, behind a flag).
@@ -269,6 +278,8 @@ export class TurboSender {
     this.viewers = new Map();
     this.needKey = true;
     this.keys = new KeyBackoff();
+    this.lastKeyAt = -Infinity; // when the encoder was last asked for a keyframe
+    this.keyTimer = 0;
     this.gop = { frames: [], rest: 0 }; // last keyframe and what came after it
     this.encoder = null;
     this.choice = null;
@@ -318,9 +329,13 @@ export class TurboSender {
 
   // Each viewer has its own limit, so one asking does not hold back another
   // who just joined; requests within the same frame still make one keyframe.
+  // All of them together stay under KEY_FLOOR_MS.
   requestKey(minInterval = KEY_INTERVAL_MS, id = null) {
     const holder = (id !== null && this.viewers.get(id)) || this;
-    if (holder.keys.allow(minInterval)) this.needKey = true;
+    if (!holder.keys.allow(minInterval)) return;
+    const wait = keyWait(this.lastKeyAt, performance.now());
+    if (!wait) { this.needKey = true; return; }
+    this.keyTimer ||= setTimeout(() => { this.keyTimer = 0; this.needKey = true; }, wait);
   }
 
   // Bytes allowed in a viewer's send queue: a few average frames, plus what is
@@ -352,6 +367,7 @@ export class TurboSender {
 
   stop() {
     this.closed = true;
+    clearTimeout(this.keyTimer);
     this.reader.cancel().catch(() => {});
     try { this.encoder?.close(); } catch {}
     this.viewers.clear();
@@ -387,6 +403,7 @@ export class TurboSender {
     if (!this.encoder || this.encoder.encodeQueueSize >= MAX_ENCODE_QUEUE) { frame.close(); this.stats.skipped++; return; }
     const keyFrame = this.needKey;
     this.needKey = false;
+    if (keyFrame) this.lastKeyAt = performance.now();
     if (this.pending.size > 120) this.pending.clear();
     this.pending.set(frame.timestamp, performance.now());
     this.encoder.encode(frame, { keyFrame });
