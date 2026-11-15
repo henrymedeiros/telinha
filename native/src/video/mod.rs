@@ -109,6 +109,9 @@ pub struct Stats {
     pub error: Option<String>,
     /// The source went away (a window closed): what to tell the person.
     pub ended: Option<String>,
+    /// A codec the session asked for that could not be produced, with the one
+    /// in effect instead. Taken by the session (`Control::take_codec_refused`).
+    pub codec_refused: Option<(Codec, Codec)>,
 }
 
 /// How long each stage took per frame (ms) since the last read, for the
@@ -154,6 +157,9 @@ pub struct Control {
     /// that opened fine and then would not encode.
     #[cfg(test)]
     pub reject_frames: std::sync::atomic::AtomicU32,
+    /// Tests only: every frame of this codec is refused.
+    #[cfg(test)]
+    pub reject_codec: Mutex<Option<Codec>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -232,6 +238,11 @@ impl Control {
 
     pub fn take_timings(&self) -> Timings {
         std::mem::take(&mut *self.timings.lock().unwrap())
+    }
+
+    /// See [`Stats::codec_refused`].
+    pub fn take_codec_refused(&self) -> Option<(Codec, Codec)> {
+        self.stats.lock().unwrap().codec_refused.take()
     }
 
     /// See [`Gop::replay`].
@@ -475,6 +486,12 @@ fn start_at(rejected: Option<Rejected>, kind: SourceKind, codec: Codec) -> usize
     rejected.filter(|r| r.kind == kind && r.codec == codec).map_or(0, |r| r.next)
 }
 
+/// What to go back to when every encoder of `codec` failed its trial: H.264,
+/// which every viewer decodes, unless H.264 itself is what just ran out.
+fn fallback_codec(codec: Codec) -> Option<Codec> {
+    (codec != Codec::H264).then_some(Codec::H264)
+}
+
 /// A pipeline on trial. An encoder that opens has proven little: some drivers
 /// only refuse when the first frame arrives. Until a packet has come out, an
 /// error on a frame means "this encoder does not work here" and the next
@@ -583,11 +600,24 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
             let encoder;
             (pipe, encoder) = match build(kind, native, pixel, &settings, next, &origin) {
                 Ok(built) => built,
-                // Nothing else works: what is reported is why the last one failed.
-                Err(none) => {
-                    tracing::warn!("no other encoder to try: {none}");
-                    return Err(e);
-                }
+                Err(none) => match fallback_codec(settings.codec) {
+                    // No encoder of this codec works here: the stream goes back to
+                    // H.264 and the session is told, so it stops asking for it.
+                    Some(back) => {
+                        tracing::warn!(codec = ?settings.codec, "no encoder of this codec works here ({none}); back to H.264");
+                        control.stats.lock().unwrap().codec_refused = Some((settings.codec, back));
+                        settings.codec = back;
+                        match build(kind, native, pixel, &settings, start_at(rejected, kind, back), &origin) {
+                            Ok(built) => built,
+                            Err(_) => return Err(e),
+                        }
+                    }
+                    // Nothing else works: what is reported is why the last one failed.
+                    None => {
+                        tracing::warn!("no other encoder to try: {none}");
+                        return Err(e);
+                    }
+                },
             };
             stage.install(encoder);
             trial = Trial::new(control.stats.lock().unwrap().encoded);
@@ -614,7 +644,11 @@ fn run(source: Source, quality: Quality, control: &Arc<Control>, out: broadcast:
                 Change::Nothing => settings.quality = next.quality,
                 change => {
                     if change == Change::Rebuild {
+                        let wanted = next.codec;
                         (pipe, settings) = rebuild(pipe, &stage, kind, native, pixel, settings, next, &origin, rejected)?;
+                        if settings.codec != wanted {
+                            control.stats.lock().unwrap().codec_refused = Some((wanted, settings.codec));
+                        }
                         trial = Trial::new(control.stats.lock().unwrap().encoded);
                         // The last image goes into the new pipeline too: a still
                         // screen then gets its keyframe at the new size without
@@ -1253,6 +1287,36 @@ mod tests {
         // It waits for the window instead of asking again at once.
         assert!(asked < 2000, "the loop spun: it asked the source {asked} times in a second");
         assert!(after.iter().any(|f| f.key && (f.width, f.height) == (960, 720)), "no keyframe at the new size from a still window");
+    }
+
+    #[test]
+    fn codec_sem_codificador_que_funcione_volta_para_o_h264() {
+        let frames = (0..60u64).map(|k| (k * 30, (320, 240))).collect();
+        let (janela, _dropped) = Janela::new(frames, None);
+        let (tx, mut rx) = broadcast::channel(256);
+        let control = start(Source::Cpu(Box::new(janela)), qualidade(), tx);
+        let Some(_) = saida(&control, &mut rx, 700) else { return };
+        // Every HEVC encoder fails the way a bad driver would, whether or not this machine has one.
+        *control.reject_codec.lock().unwrap() = Some(Codec::Hevc);
+        control.reconfigure(Settings { quality: qualidade(), bitrate: qualidade().bitrate((320, 240)), codec: Codec::Hevc });
+        let after = saida(&control, &mut rx, 1500);
+        let refused = control.take_codec_refused();
+        let error = control.stats().error;
+        control.stop.store(true, Ordering::Relaxed);
+        assert!(error.is_none(), "the stream ended: {error:?}");
+        let after = after.unwrap_or_default();
+        assert!(!after.is_empty(), "nothing came out after the change");
+        // A refused codec never reaches viewers.
+        let codecs: Vec<&str> = after.iter().map(|f| f.codec.as_str()).collect();
+        assert!(codecs.iter().all(|c| c.starts_with("avc")), "frames that are not H.264: {codecs:?}");
+        assert_eq!(refused, Some((Codec::Hevc, Codec::H264)));
+    }
+
+    #[test]
+    fn so_o_h264_nao_tem_para_onde_voltar() {
+        assert_eq!(fallback_codec(Codec::Hevc), Some(Codec::H264));
+        assert_eq!(fallback_codec(Codec::Av1), Some(Codec::H264));
+        assert_eq!(fallback_codec(Codec::H264), None);
     }
 
     #[test]

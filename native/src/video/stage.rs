@@ -180,7 +180,11 @@ fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, o
     if control.reject_frames.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok() {
         return Err(ffi::Error("teste: quadro recusado".into()));
     }
-    let Job { mut frame, captured, converted, size, codec } = job;
+    #[cfg(test)]
+    if *control.reject_codec.lock().unwrap() == Some(job.codec) {
+        return Err(ffi::Error("teste: codec recusado".into()));
+    }
+    let Job { mut frame, captured, converted, size, codec: job_codec } = job;
     let mut o = shared.out.lock().unwrap();
     let key = control.force_key.swap(false, Ordering::Relaxed);
     frame.set_keyframe(key);
@@ -204,7 +208,8 @@ fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, o
             st.encoded += 1;
             st.encode_ms = Some(st.encode_ms.map_or(ms, |p| p * 0.9 + ms * 0.1));
         }
-        let (data, codec) = match codec {
+        let pkt_key = pkt.key;
+        let (data, codec) = match job_codec {
             Codec::H264 => {
                 let data = o.headers.fix_keyframe(pkt.data, pkt.key);
                 (data, o.headers.codec())
@@ -218,7 +223,15 @@ fn encode(encoder: &mut Encoder, shared: &Shared, job: Job, control: &Control, o
                 (data, o.av1.codec())
             }
         };
-        let Some(codec) = codec else { continue };
+        let Some(codec) = codec else {
+            // A keyframe viewers cannot start from (no parameter sets or
+            // sequence header yet). Normal for H.264's first frames; for the
+            // other codecs it means this encoder's stream is unusable.
+            if pkt_key && job_codec != Codec::H264 {
+                control.stats.lock().unwrap().codec_refused = Some((job_codec, job_codec));
+            }
+            continue;
+        };
         o.index += 1;
         let frame = Arc::new(EncodedFrame { data: Bytes::from(data), key: pkt.key, codec, width: size.0, height: size.1, captured, index: o.index });
         // Into the cache before it goes out: a sender subscribed to `out`
