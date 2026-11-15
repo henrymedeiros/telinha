@@ -119,10 +119,13 @@ impl EncodeStage {
     }
 
     /// Takes the encoder out for a rebuild; frames converted for it are
-    /// dropped (they belong to the old pipeline).
+    /// dropped (they belong to the old pipeline). An error the encoder thread
+    /// left behind is about the encoder being taken out, so it goes too and does
+    /// not count against the one installed next.
     pub fn remove(&self) -> Option<Encoder> {
         let mut enc = self.encoder();
         drop(self.shared.slot.lock().unwrap().take());
+        *self.shared.failed.lock().unwrap() = None;
         enc.take()
     }
 
@@ -350,5 +353,18 @@ mod tests {
         // What `encode` holds for as long as a frame is in the encoder.
         let _encoding = stage.shared.out.lock().unwrap();
         assert_eq!(stage.encode_ms(), 0.0);
+    }
+
+    #[test]
+    fn erro_do_codificador_retirado_nao_vale_para_o_proximo() {
+        let (tx, _rx) = broadcast::channel(4);
+        let stage = EncodeStage::start(Arc::new(Control::default()), tx);
+        // Left alone, the error is there for the capture thread.
+        *stage.shared.failed.lock().unwrap() = Some(ffi::Error("x".into()));
+        assert!(stage.failure().is_some());
+        // Taking the encoder out takes its error with it.
+        *stage.shared.failed.lock().unwrap() = Some(ffi::Error("x".into()));
+        drop(stage.remove());
+        assert!(stage.failure().is_none());
     }
 }
