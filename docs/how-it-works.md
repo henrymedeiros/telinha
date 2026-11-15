@@ -81,4 +81,5 @@ The stream only counts as on air once the video thread has an encoder running, s
 
 * Each viewer gets their own copy of the video, so the streamer's upload speed limits the group. 4 or 5 people work well.
 * A channel takes up to 12 people. The next one to arrive is told it is full. However many viewers ask, the site's minimum delay mode makes at most two keyframes per second.
+* A channel opened from the desktop app holds at most 12 people (the same as a channel opened on the site), and at most 6 can be joining at the same moment; a request past that gets no answer and the joiner is told to try again. The app also reads at most 12 entries of another host's list. These are well above a real group and only bound what a stranger with the channel number can make the app do.
 * Phones can watch, but most cannot stream.

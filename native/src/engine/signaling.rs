@@ -46,6 +46,10 @@ const RETRY_MAX: Duration = Duration::from_secs(8);
 const GIVE_UP: Duration = Duration::from_secs(60);
 /// Messages kept while the connection is down (the newest ones).
 const HELD_MAX: usize = 64;
+/// Largest signaling message read. An offer with all its candidates is a few
+/// kilobytes; the library's default (64 MiB) lets anyone who can reach this id
+/// make the app parse and copy that much.
+const MAX_MESSAGE: usize = 1 << 20;
 
 /// How long to wait before reconnect try number `attempt` (0 is the first),
 /// or `None` once the connection has been down too long to keep trying.
@@ -74,7 +78,8 @@ fn parse(text: &str) -> Option<Signal> {
 }
 
 async fn open(url: &str) -> Result<Socket, String> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url)).await {
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+    match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async_with_config(url, Some(config), false)).await {
         Ok(Ok((ws, _))) => Ok(ws),
         Ok(Err(e)) => Err(format!("sinalização: {e}")),
         Err(_) => Err("sinalização: o servidor demorou demais para responder".into()),

@@ -139,6 +139,19 @@ struct Starting {
 const FIRST_FRAME: Duration = Duration::from_secs(15);
 /// Pause before opening again a viewer's connection that fell mid-stream.
 const REOPEN_AFTER: Duration = Duration::from_secs(3);
+/// Most people a channel holds when this app is the host, itself included, and
+/// most entries it takes from another host's list. The documented group is 4
+/// or 5 (every viewer is one more copy of the video from the streamer's
+/// upload); this is well above that and still bounds what a stranger with the
+/// channel number can make the app open.
+const MAX_MEMBERS: usize = 12;
+/// Most joiners still connecting at once. A real join opens in a second or
+/// two; one that never does is dropped when its ICE fails, about 30 s later.
+const MAX_PENDING_GUESTS: usize = 6;
+/// Longest name kept, in characters (the site cuts names at 24 too).
+const NAME_CHARS: usize = 24;
+/// Longest peer id or connection id accepted, in bytes: real ones are a few dozen.
+const ID_BYTES: usize = 128;
 
 struct Live {
     audio: Option<crate::audio::Audio>,
@@ -291,6 +304,8 @@ struct Session {
     /// When to open again the video or sound of a viewer whose connection fell
     /// during the stream (see `on_conn_closed`).
     reopen_at: Option<Instant>,
+    /// A join was refused already (said once in the log, not once per request).
+    join_refused: bool,
 }
 
 pub async fn run(mut cmds: mpsc::Receiver<Command>, ui: mpsc::Sender<Event>) {
@@ -397,6 +412,7 @@ async fn start(ui: &mpsc::Sender<Event>, name: String, server: Option<String>, c
         starting: None,
         attempt: 0,
         reopen_at: None,
+        join_refused: false,
     };
     s.spawn_signal_forwarder(sig_rx, peer_rx);
 
@@ -737,8 +753,17 @@ impl Session {
         if !is_join(&payload) || !matches!(self.role, Role::Host) {
             return;
         }
-        let meta = payload["metadata"].clone();
         let conn = payload["connectionId"].as_str().unwrap_or_default().to_owned();
+        let pending = self.conns.values().filter(|c| c.kind == Kind::Guest && !c.open).count();
+        if !admits(self.members.len(), pending, self.conns.contains_key(&conn), &conn, &src) {
+            // The joiner gets no answer and its own timeout tells it to try again.
+            if !self.join_refused {
+                self.join_refused = true;
+                tracing::warn!(members = self.members.len(), pending, "join refused: the channel is full, too many joins are under way, or the request repeats a connection (said once)");
+            }
+            return;
+        }
+        let meta = guest_meta(&payload["metadata"]);
         let sdp = payload["sdp"]["sdp"].as_str().unwrap_or_default().to_owned();
         let Ok(pc) = peer::new_connection(&self.ice, &conn, false, self.peers.clone()).await else { return };
         let Ok(desc) = RTCSessionDescription::offer(sdp) else { return };
@@ -834,7 +859,7 @@ impl Session {
             }
             (Kind::Guest, Which::Control) => {
                 c.open = true;
-                let name = c.meta["name"].as_str().unwrap_or("Alguém").chars().take(24).collect();
+                let name = c.meta["name"].as_str().unwrap_or("Alguém").chars().take(NAME_CHARS).collect();
                 let wc = c.meta["wc"].as_bool().unwrap_or(false);
                 let id = c.peer.clone();
                 self.members.retain(|m| m.id != id);
@@ -913,21 +938,7 @@ impl Session {
         let Some(kind) = self.conns.get(&conn).map(|c| c.kind) else { return Ok(()) };
         match (kind, v["t"].as_str().unwrap_or_default()) {
             (Kind::HostLink, "roster") => {
-                let members: Vec<Member> = v["members"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .map(|m| Member {
-                                id: m["id"].as_str().unwrap_or_default().to_owned(),
-                                name: m["name"].as_str().unwrap_or("Alguém").to_owned(),
-                                sharing: m["sharing"].as_bool().unwrap_or(false),
-                                wc: m["wc"].as_bool().unwrap_or(false),
-                                dec: decoders(&m["dec"]),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.members = members;
+                self.members = roster_from(&v);
                 self.chime();
                 self.publish_viewers().await;
                 self.sync_viewers().await;
@@ -938,9 +949,13 @@ impl Session {
             }
             (Kind::Guest, "sharing") => {
                 let peer = self.conns.get(&conn).map(|c| c.peer.clone()).unwrap_or_default();
-                if let Some(m) = self.members.iter_mut().find(|m| m.id == peer) {
-                    m.sharing = v["on"].as_bool().unwrap_or(false);
+                let on = v["on"].as_bool().unwrap_or(false);
+                // Unknown sender or nothing new: no list for everyone, no connections reviewed.
+                let Some(m) = self.members.iter_mut().find(|m| m.id == peer) else { return Ok(()) };
+                if m.sharing == on {
+                    return Ok(());
                 }
+                m.sharing = on;
                 self.broadcast_roster().await;
             }
             (Kind::Turbo, "key") => {
@@ -1661,6 +1676,57 @@ fn is_join(offer: &Value) -> bool {
     offer["type"] == "data" && offer["metadata"]["kind"].is_null()
 }
 
+/// A string field from a peer, or nothing if it is missing or longer than `max` bytes.
+fn short_str(v: &Value, max: usize) -> String {
+    v.as_str().filter(|s| s.len() <= max).unwrap_or_default().to_owned()
+}
+
+/// Whether the host takes this join request: there is room, not too many
+/// joins are already under way, and it does not reuse a connection id (which
+/// would silently replace that connection).
+fn admits(members: usize, pending: usize, known_conn: bool, conn_id: &str, src: &str) -> bool {
+    let sane = |id: &str| !id.is_empty() && id.len() <= ID_BYTES;
+    sane(conn_id) && sane(src) && !known_conn && members < MAX_MEMBERS && pending < MAX_PENDING_GUESTS
+}
+
+/// What a joiner says about itself, reduced to the fields the app reads and
+/// to sizes it chose. Nothing else from the peer's metadata is kept.
+fn guest_meta(meta: &Value) -> Value {
+    let name: String = meta["name"].as_str().unwrap_or("Alguém").chars().take(NAME_CHARS).collect();
+    json!({
+        "name": name,
+        "wc": meta["wc"].as_bool().unwrap_or(false),
+        "dec": decoders(&meta["dec"]),
+        "restart": short_str(&meta["restart"], 16),
+    })
+}
+
+/// The member list a host sent (the whole `roster` message), cleaned: entries
+/// without an id or repeating one are dropped, names are cut, and the list
+/// stops at `MAX_MEMBERS`.
+fn roster_from(v: &Value) -> Vec<Member> {
+    let mut seen = std::collections::HashSet::new();
+    v["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = short_str(&m["id"], ID_BYTES);
+            if id.is_empty() || !seen.insert(id.clone()) {
+                return None;
+            }
+            Some(Member {
+                id,
+                name: m["name"].as_str().unwrap_or("Alguém").chars().take(NAME_CHARS).collect(),
+                sharing: m["sharing"].as_bool().unwrap_or(false),
+                wc: m["wc"].as_bool().unwrap_or(false),
+                dec: decoders(&m["dec"]),
+            })
+        })
+        .take(MAX_MEMBERS)
+        .collect()
+}
+
 /// What the person reads when, after a reconnect, the server says the id now
 /// belongs to someone else. For a host that id is the channel number.
 fn lost_id_text(host: bool, code: &str) -> String {
@@ -1716,6 +1782,54 @@ fn rtp_cap(estimates: &[(String, u32)]) -> (Option<u32>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canal_cheio_ou_pedido_repetido_nao_entra() {
+        assert!(admits(1, 0, false, "dc_abc", "peer-1"));
+        assert!(admits(MAX_MEMBERS - 1, MAX_PENDING_GUESTS - 1, false, "dc_abc", "peer-1"));
+        assert!(!admits(MAX_MEMBERS, 0, false, "dc_abc", "peer-1"));
+        assert!(!admits(1, MAX_PENDING_GUESTS, false, "dc_abc", "peer-1"));
+        // Would replace a connection that exists.
+        assert!(!admits(1, 0, true, "dc_abc", "peer-1"));
+        assert!(!admits(1, 0, false, "", "peer-1"));
+        assert!(!admits(1, 0, false, "dc_abc", ""));
+        assert!(!admits(1, 0, false, &"x".repeat(ID_BYTES + 1), "peer-1"));
+    }
+
+    #[test]
+    fn metadados_de_quem_entra_ficam_so_com_o_que_o_app_usa() {
+        let big = "x".repeat(10_000);
+        let m = guest_meta(&json!({ "name": "A".repeat(100), "wc": true, "avatar": big.clone(), "dec": ["hevc", "av1"], "restart": "hidden", "lixo": big.clone(), "outro": { "a": [1, 2, 3] } }));
+        assert_eq!(m.as_object().map(|o| o.len()), Some(4));
+        assert_eq!(m["name"].as_str().map(|n| n.chars().count()), Some(24));
+        assert_eq!(m["wc"], true);
+        assert_eq!(m["dec"], json!(["hevc", "av1"]));
+        assert_eq!(m["restart"], "hidden");
+        // Nothing sent at all: the defaults the join code expects.
+        let empty = guest_meta(&Value::Null);
+        assert_eq!(empty["name"], "Alguém");
+        assert_eq!(empty["wc"], false);
+    }
+
+    #[test]
+    fn lista_do_canal_vem_limpa() {
+        let many: Vec<Value> = (0..100).map(|i| json!({ "id": format!("p{i}"), "name": "Ana" })).collect();
+        assert_eq!(roster_from(&json!({ "members": many })).len(), MAX_MEMBERS);
+        let r = roster_from(&json!({ "members": [
+            { "id": "a", "name": "N".repeat(100), "sharing": true, "wc": true, "dec": ["hevc"] },
+            { "id": "a", "name": "repetido" },
+            { "name": "sem id" },
+            { "id": "", "name": "id vazio" },
+            { "id": "b" },
+        ] }));
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].id.as_str(), r[0].name.chars().count(), r[0].sharing, r[0].wc), ("a", 24, true, true));
+        assert_eq!(r[0].dec, vec!["hevc".to_owned()]);
+        assert_eq!((r[1].id.as_str(), r[1].name.as_str()), ("b", "Alguém"));
+        // Not a list at all.
+        assert!(roster_from(&json!({})).is_empty());
+        assert!(roster_from(&json!({ "members": "x" })).is_empty());
+    }
 
     #[test]
     fn canal_perdido_na_reconexao_diz_o_que_fazer() {
