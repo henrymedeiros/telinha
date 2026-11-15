@@ -219,7 +219,30 @@ pub fn gfxcapture_filter(hwnd: u64) -> String {
 }
 
 /// Fixed so a quality change does not reopen the capture.
-const MAX_FPS: u32 = 60;
+pub const MAX_FPS: u32 = 60;
+
+/* ---------------- A window that fills its monitor ---------------- */
+
+/// A rectangle in desktop coordinates, as Windows gives them (`right` and
+/// `bottom` just outside).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Whether a shared window should be captured through its monitor right now.
+/// Windows 10 draws a yellow border around a captured window and cannot be
+/// asked not to; the monitor's own capture has none. A window in front that
+/// covers its whole monitor looks exactly like that monitor, so that is the
+/// only case: anything else on the monitor must never reach the viewers.
+/// Full-screen games often report a rectangle a few pixels larger.
+pub fn through_monitor(borderless: bool, window: Rect, monitor: Rect, foreground: bool, minimized: bool) -> bool {
+    let covers = window.left <= monitor.left && window.top <= monitor.top && window.right >= monitor.right && window.bottom >= monitor.bottom;
+    !borderless && foreground && !minimized && covers
+}
 
 /* ---------------- Resizing ---------------- */
 
@@ -356,6 +379,37 @@ mod tests {
         assert!(g.starts_with("gfxcapture=hwnd=66052:"), "{g}");
         assert!(g.contains("width=-2:height=-2"), "even sizes: {g}");
         assert!(g.contains("resize_mode=scale_aspect"), "{g}");
+    }
+
+    const TELA: Rect = Rect { left: 1920, top: 0, right: 3840, bottom: 1080 };
+
+    #[test]
+    fn janela_que_cobre_a_tela_vai_pela_tela() {
+        assert!(through_monitor(false, TELA, TELA, true, false), "exactly the monitor");
+        let maior = Rect { left: 1912, top: -8, right: 3848, bottom: 1088 };
+        assert!(through_monitor(false, maior, TELA, true, false), "a few pixels larger");
+    }
+
+    #[test]
+    fn janela_um_pixel_menor_fica_na_janela() {
+        let casos: [(&str, fn(&mut Rect)); 4] = [
+            ("left", |r| r.left += 1),
+            ("top", |r| r.top += 1),
+            ("right", |r| r.right -= 1),
+            ("bottom", |r| r.bottom -= 1),
+        ];
+        for (lado, muda) in casos {
+            let mut janela = TELA;
+            muda(&mut janela);
+            assert!(!through_monitor(false, janela, TELA, true, false), "{lado}");
+        }
+    }
+
+    #[test]
+    fn so_pela_tela_em_primeiro_plano_e_sem_borda_possivel() {
+        assert!(!through_monitor(false, TELA, TELA, false, false), "not in front");
+        assert!(!through_monitor(false, TELA, TELA, true, true), "minimized");
+        assert!(!through_monitor(true, TELA, TELA, true, false), "Windows allows a capture without the border");
     }
 
     #[test]
