@@ -248,6 +248,22 @@ const CANDIDATES = [
   ["vp8", "prefer-software"],
 ];
 
+// Codecs past H.264 the sender may use, best first (AV1 gives the most picture
+// per bit), and the string asked of the encoder: 8-bit, a level that covers 4K60.
+const EXTRA_CODECS = [["av1", "av01.0.13M.08"], ["hevc", "hvc1.1.6.L153.B0"]];
+
+/** The first name in `order` that every list has; null with no lists or nothing in common. */
+export function sharedCodec(lists, order) {
+  if (!lists.length) return null;
+  return order.find((name) => lists.every((l) => l.includes(name))) ?? null;
+}
+
+/** Which of them this page may use, best first: only the ones ?enc= names (not yet tried on real viewers). */
+export function enabledCodecs(search) {
+  const asked = (new URLSearchParams(search ?? "").get("enc") ?? "").split(",");
+  return EXTRA_CODECS.map(([name]) => name).filter((name) => asked.includes(name));
+}
+
 function encoderConfig({ codec, hw, mode }, width, height, bitrate, framerate) {
   return {
     codec, width, height, bitrate, framerate,
