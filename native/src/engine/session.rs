@@ -276,7 +276,7 @@ struct Session {
     inputs: Option<mpsc::Receiver<Input>>,
     /// Who receives via RTP after doing poorly on the data channel (or via relay).
     demoted: std::collections::HashSet<String>,
-    /// Of those, who receives through the relay (keeps the bitrate at RELAY_BITRATE).
+    /// Who gets the RTP video through the relay (keeps the bitrate at RELAY_BITRATE): data channel viewers who reported it and were moved to RTP, and RTP viewers whose selected path is the relay (see `note_path`).
     relayed: std::collections::HashSet<String>,
     /// Who said they decode HEVC but could not: H.264 for the rest of the stream.
     no_hevc: std::collections::HashSet<String>,
@@ -1445,7 +1445,7 @@ impl Session {
         give_up && c.kind == Kind::Turbo
     }
 
-    /// Looks at the pair ICE settled on: logs it the first time and keeps it for the viewer lines.
+    /// Looks at the pair ICE settled on: logs it the first time, keeps it for the viewer lines, and counts RTP video through the relay for the bitrate ceiling.
     async fn note_path(&mut self, conn: &str) {
         let Some(c) = self.conns.get_mut(conn) else { return };
         let Some(sel) = path::of_connection(&c.pc).await else { return };
@@ -1453,6 +1453,22 @@ impl Session {
             let who = self.members.iter().find(|m| m.id == c.peer).map_or(c.peer.as_str(), |m| m.name.as_str());
             tracing::info!(who, network = sel.path.as_str(), pair = sel.types, rtt_ms = sel.rtt_ms.map(|r| (r * 10.0).round() / 10.0), "connection path");
             c.path = Some(sel.path);
+        }
+        let through_relay = video_through_relay(c.kind, c.audio_only, sel.path);
+        let peer = c.peer.clone();
+        match through_relay {
+            // New on the relay: the shared bitrate comes down to its ceiling now.
+            Some(true) => {
+                if self.relayed.insert(peer) {
+                    self.cap_for_relay();
+                }
+            }
+            // Found a direct path after all (a new connection, or ICE moved):
+            // the ceiling lifts and the usual steps climb back.
+            Some(false) => {
+                self.relayed.remove(&peer);
+            }
+            None => {}
         }
     }
 
@@ -1659,6 +1675,14 @@ fn pick_codec(enabled: bool, viewers: &[(bool, bool)], rtp: bool) -> video::Code
     if enabled && !rtp && !viewers.is_empty() && viewers.iter().all(|&(turbo, hevc)| turbo && hevc) { video::Codec::Hevc } else { video::Codec::H264 }
 }
 
+/// Whether a connection's path says its viewer gets the video through the
+/// relay. `None`: this connection carries no RTP video, so it says nothing —
+/// data channel viewers report the relay themselves (and are moved to RTP for
+/// it), and a sound-only call just follows them.
+fn video_through_relay(kind: Kind, audio_only: bool, path: Path) -> Option<bool> {
+    (kind == Kind::Media && !audio_only).then_some(path == Path::Relay)
+}
+
 /// What the RTP viewers' estimates allow for the shared video, and which
 /// viewer (if any) is left out for being far below the next worst: one bad
 /// network should not take everyone's picture down with it. That viewer still
@@ -1679,6 +1703,18 @@ fn rtp_cap(estimates: &[(String, u32)]) -> (Option<u32>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn so_video_por_rtp_no_relay_conta_para_o_teto() {
+        assert_eq!(video_through_relay(Kind::Media, false, Path::Relay), Some(true));
+        assert_eq!(video_through_relay(Kind::Media, false, Path::Direct), Some(false));
+        assert_eq!(video_through_relay(Kind::Media, false, Path::Lan), Some(false));
+        // Sound only, the data channel and the channel's own links say nothing.
+        assert_eq!(video_through_relay(Kind::Media, true, Path::Relay), None);
+        assert_eq!(video_through_relay(Kind::Turbo, false, Path::Relay), None);
+        assert_eq!(video_through_relay(Kind::Guest, false, Path::Relay), None);
+        assert_eq!(video_through_relay(Kind::HostLink, false, Path::Relay), None);
+    }
 
     #[test]
     fn so_o_elo_com_o_dono_encerra_a_sessao() {
