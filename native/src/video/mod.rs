@@ -1,6 +1,7 @@
 //! Video pipeline: capture → filters (scale/GPU upload) → encoder.
 //! Runs on its own thread and publishes H.264 frames ready to send.
 
+pub mod av1;
 pub mod encoders;
 pub mod ffi;
 pub mod h264;
