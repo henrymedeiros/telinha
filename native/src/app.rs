@@ -812,7 +812,7 @@ impl Controller {
             Event::Joined { code, invite, server } => {
                 self.session = Session::Channel { code, invite, live: false };
                 self.joining = false;
-                self.config.server = Some(server);
+                self.config.joined(&server);
                 self.config.save();
                 self.close_panel();
                 if self.flow.awaiting_channel() {

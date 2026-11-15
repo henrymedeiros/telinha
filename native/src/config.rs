@@ -99,7 +99,7 @@ pub struct Config {
     pub quality: Quality,
     #[serde(default)]
     pub name: String,
-    /// Last server used (comes from the invite link).
+    /// The server the app goes back to: the build's own, or the last invite link's (see `remembered_server`).
     #[serde(default)]
     pub server: Option<String>,
     #[serde(default)]
@@ -116,6 +116,18 @@ impl Default for Config {
 /// the app then asks for an invite link on first run.
 pub fn default_server() -> Option<&'static str> {
     option_env!("TELINHA_SERVER").filter(|s| !s.is_empty())
+}
+
+/// The server the app goes back to. A build made for one server always goes
+/// back to it: a link to another server counts for that visit only, and a
+/// config that an older version repointed that way heals on load. A public
+/// build has no server of its own, so it remembers the last link it joined
+/// through (pasting one is how the person tells it which server to use).
+fn remembered_server(baked: Option<&str>, saved: Option<String>, joined: Option<&str>) -> Option<String> {
+    match baked {
+        Some(own) => Some(own.to_owned()),
+        None => joined.map(str::to_owned).or(saved),
+    }
 }
 
 /// The app's folders: Linux ~/.config/telinha and ~/.local/share/telinha,
@@ -138,10 +150,13 @@ impl Config {
         if cfg.name.trim().is_empty() {
             cfg.name = whoami();
         }
-        if cfg.server.is_none() {
-            cfg.server = default_server().map(str::to_owned);
-        }
+        cfg.server = remembered_server(default_server(), cfg.server.take(), None);
         cfg
+    }
+
+    /// A channel was joined on `server`.
+    pub fn joined(&mut self, server: &str) {
+        self.server = remembered_server(default_server(), self.server.take(), Some(server));
     }
 
     pub fn save(&self) {
@@ -260,5 +275,19 @@ mod tests {
         assert_eq!(c.position, Some((10.0, 20.0)));
         let saved = serde_json::to_value(&c).unwrap();
         assert!(saved.get("discord_session").is_none() && saved.get("discord_name").is_none() && saved.get("call_only").is_none());
+    }
+
+    #[test]
+    fn servidor_embutido_nunca_e_trocado_por_um_link() {
+        let s = |v: &str| Some(v.to_owned());
+        // A build made for a server: always that one, whatever was saved or joined.
+        assert_eq!(remembered_server(Some("meu.test"), None, None), s("meu.test"));
+        assert_eq!(remembered_server(Some("meu.test"), s("outro.test"), None), s("meu.test"));
+        assert_eq!(remembered_server(Some("meu.test"), s("meu.test"), Some("outro.test")), s("meu.test"));
+        // A public build: nothing until a link is joined, then the last one joined.
+        assert_eq!(remembered_server(None, None, None), None);
+        assert_eq!(remembered_server(None, None, Some("a.test")), s("a.test"));
+        assert_eq!(remembered_server(None, s("a.test"), None), s("a.test"));
+        assert_eq!(remembered_server(None, s("a.test"), Some("b.test")), s("b.test"));
     }
 }
