@@ -239,7 +239,8 @@ export function packetize(seq, data, key, ts, config, parity = false) {
 
 /* ---------------- Streamer ---------------- */
 
-// Preference: H.264 on the GPU, then H.264 and VP8 in software.
+// Preference: AV1 or HEVC on the GPU when every viewer decodes one (EXTRA_CODECS),
+// then H.264 on the GPU, then H.264 and VP8 in software.
 const CANDIDATES = [
   ["avc1.640034", "prefer-hardware"],
   ["avc1.4d0034", "prefer-hardware"],
@@ -271,10 +272,22 @@ function encoderConfig({ codec, hw, mode }, width, height, bitrate, framerate) {
     bitrateMode: mode,
     hardwareAcceleration: hw,
     ...(codec.startsWith("avc1") ? { avc: { format: "annexb" } } : {}), // SPS/PPS on every keyframe
+    ...(codec.startsWith("hvc1") ? { hevc: { format: "annexb" } } : {}), // VPS/SPS/PPS on every keyframe
   };
 }
 
-async function pickEncoder(width, height, bitrate, framerate) {
+// `name` (an EXTRA_CODECS name) is tried first, on the GPU only.
+async function pickEncoder(width, height, bitrate, framerate, name = null) {
+  const extra = name && EXTRA_CODECS.find(([n]) => n === name);
+  if (extra) {
+    for (const mode of ["constant", "variable"]) {
+      const choice = { codec: extra[1], hw: "prefer-hardware", mode, name };
+      try {
+        const { supported } = await VideoEncoder.isConfigSupported(encoderConfig(choice, width, height, bitrate, framerate));
+        if (supported) return choice;
+      } catch {}
+    }
+  }
   for (const [codec, hw] of CANDIDATES) {
     for (const mode of ["constant", "variable"]) {
       const choice = { codec, hw, mode };
