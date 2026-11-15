@@ -40,9 +40,6 @@ fn chime_node_name() -> String {
     format!("telinha-aviso-{}", std::process::id())
 }
 
-/// Name fragments that identify Discord and its alternative clients.
-const DISCORD: [&str; 7] = ["discord", "vesktop", "vencord", "webcord", "armcord", "legcord", "equibop"];
-
 pub fn start(tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>, plan: Plan) -> Result<String, String> {
     let everything = plan::whole_output(std::env::var_os("TELINHA_SOM_TUDO").is_some(), &plan);
     let source = match &plan {
@@ -334,7 +331,7 @@ impl Graph {
     fn add_stream(&mut self, id: u32, get: impl Fn(&str) -> Option<String>) -> bool {
         let own = get("node.name").as_deref() == Some(chime_node_name().as_str());
         let names = ["application.process.binary", "application.name", "application.id", "node.name"].map(|k| get(k).unwrap_or_default().to_lowercase());
-        let discord = names.iter().any(|n| DISCORD.iter().any(|d| n.contains(d)));
+        let discord = names.iter().any(|n| crate::capture::target::is_discord(n));
         let stream = Stream { app: plan::identity(&get), discord, own };
         let included = self.filter.includes(&stream);
         let why = if own { "Telinha's own chimes" } else if discord { "Discord" } else { "not the chosen app" };
