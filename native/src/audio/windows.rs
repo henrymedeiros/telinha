@@ -20,44 +20,13 @@ use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, W
 use super::plan::{self, OnFailure, Plan};
 use super::{CHANNELS, Problem, RATE};
 
-/// Discord's main executables. Helpers (overlay, updater) also start with
-/// "discord" but are not where the call's audio plays.
-const DISCORD_MAIN: [&str; 4] = ["discord.exe", "discordptb.exe", "discordcanary.exe", "discorddevelopment.exe"];
-
-/// Discord's root process: the main executable that is the ancestor of the
-/// most Discord processes (the call's audio plays in one of its children).
+/// Discord's root process (see `target::discord_root`): the call's audio plays
+/// in one of its children.
 fn discord_pid() -> Option<u32> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
     let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()));
-    let parent = |pid: sysinfo::Pid| sys.process(pid).and_then(|p| p.parent());
-    let discord: Vec<(sysinfo::Pid, String)> = sys
-        .processes()
-        .iter()
-        .map(|(pid, p)| (*pid, p.name().to_string_lossy().to_lowercase()))
-        .filter(|(_, name)| name.starts_with("discord") && name.ends_with(".exe"))
-        .collect();
-    let descendants = |root: sysinfo::Pid| {
-        discord
-            .iter()
-            .filter(|(pid, _)| {
-                // Walks up the parents (bounded, in case of a loop).
-                let mut cur = parent(*pid);
-                for _ in 0..16 {
-                    match cur {
-                        Some(p) if p == root => return true,
-                        Some(p) => cur = parent(p),
-                        None => return false,
-                    }
-                }
-                false
-            })
-            .count()
-    };
-    discord
-        .iter()
-        .filter(|(_, name)| DISCORD_MAIN.contains(&name.as_str()))
-        .max_by_key(|(pid, _)| descendants(*pid))
-        .map(|(pid, _)| pid.as_u32())
+    let procs: Vec<(u32, Option<u32>, String)> = sys.processes().iter().map(|(pid, p)| (pid.as_u32(), p.parent().map(|parent| parent.as_u32()), p.name().to_string_lossy().into_owned())).collect();
+    crate::capture::target::discord_root(&procs)
 }
 
 pub fn start(tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>, plan: Plan, problem: Problem) -> Result<String, String> {
