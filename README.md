@@ -61,4 +61,6 @@ Use `deploy/docker-compose.yml` instead of the setup script:
 
 Run `bun server.ts` and open http://localhost:5180. Add `?servidor=your.domain` to the address to use your server.
 
+To run the desktop app's tests on Linux: `cd native && sh scripts/fetch-deps.sh teste && cargo test`. The `teste` mode fetches only what the tests need (FFmpeg, libva and the PipeWire headers), without Docker.
+
 How it works, delay and audio: [docs/how-it-works.md](docs/how-it-works.md).
